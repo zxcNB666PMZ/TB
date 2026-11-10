@@ -19,15 +19,21 @@ st.set_page_config(page_title="财务 AI 助手", page_icon="💼", layout="wide
 st.title("💼 财务 AI 智能分析与台账助手")
 
 client = ZhipuAI(api_key=os.getenv("ZHIPU_API_KEY"))
+
 # ==========================================
 # 侧边栏：功能切换
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 功能菜单")
-    app_mode = st.radio("请选择功能模块：", ["💬 财报文档问答 (RAG)", "🧾 批量发票识别台账", "🗄️ 历史数据查询"])
+    app_mode = st.radio("请选择功能模块：", [
+        "💬 财报文档问答 (RAG)", 
+        "🧾 批量发票识别台账", 
+        "🗄️ 历史数据查询", 
+        "📈 流水智能分类"
+    ])
 
 # ==========================================
-# 模块一：原有 RAG 问答模块 (保持不变)
+# 模块一：原有 RAG 问答模块
 # ==========================================
 if app_mode == "💬 财报文档问答 (RAG)":
     st.subheader("财报文档智能问答")
@@ -147,17 +153,14 @@ elif app_mode == "🧾 批量发票识别台账":
             
             st.dataframe(df, use_container_width=True)
             
-            # 🌟 核心新增：存入 SQLite 数据库
             try:
                 conn = sqlite3.connect('finance.db')
-                # if_exists='append' 表示如果表已存在，就把新数据追加进去
                 df.to_sql('invoices', conn, if_exists='append', index=False)
                 conn.close()
                 st.success("💾 数据已成功沉淀到本地数据库 (finance.db)！")
             except Exception as e:
                 st.error(f"数据库保存失败: {e}")
             
-            # 提供下载功能
             csv = df.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
                 label="📥 下载本次识别为 CSV",
@@ -167,7 +170,7 @@ elif app_mode == "🧾 批量发票识别台账":
             )
 
 # ==========================================
-# 模块三：历史数据查询（从数据库读取）
+# 模块三：历史数据查询 + 商业可视化 + AI 诊断
 # ==========================================
 elif app_mode == "🗄️ 历史数据查询":
     st.subheader("📊 历史发票数据库与商业看板")
@@ -179,10 +182,9 @@ elif app_mode == "🗄️ 历史数据查询":
         conn.close()
         
         if not df_history.empty:
-            # 基础数据清洗（防止有脏数据）
             df_history['价税合计'] = pd.to_numeric(df_history['价税合计'], errors='coerce').fillna(0)
             
-            # 1. 展示 KPI 核心指标卡片
+            # 1. KPI 卡片
             col1, col2, col3 = st.columns(3)
             total_amount = df_history['价税合计'].sum()
             total_count = len(df_history)
@@ -194,33 +196,59 @@ elif app_mode == "🗄️ 历史数据查询":
             
             st.markdown("---")
             
-            # 2. 绘制商业图表 (使用两列布局)
+            # 2. 图表
             chart_col1, chart_col2 = st.columns(2)
-            
             with chart_col1:
                 st.write("**🏢 供应商支出占比 (Top 10)**")
-                # 按购买方名称汇总金额
                 supplier_df = df_history.groupby('购买方名称')['价税合计'].sum().reset_index()
-                # 排序取前十
                 supplier_df = supplier_df.sort_values(by='价税合计', ascending=False).head(10)
-                # 画环形图
                 fig_pie = px.pie(supplier_df, values='价税合计', names='购买方名称', hole=0.4)
                 fig_pie.update_layout(margin=dict(t=0, b=0, l=0, r=0), height=350)
                 st.plotly_chart(fig_pie, use_container_width=True)
                 
             with chart_col2:
                 st.write("**📅 开票金额日期趋势**")
-                # 按日期汇总金额（需要先转成日期格式）
                 df_history['开票日期'] = pd.to_datetime(df_history['开票日期'], errors='coerce')
                 date_df = df_history.groupby('开票日期')['价税合计'].sum().reset_index()
-                # 画柱状图
                 fig_bar = px.bar(date_df, x='开票日期', y='价税合计', text_auto='.2s')
                 fig_bar.update_layout(margin=dict(t=0, b=0, l=0, r=0), height=350, xaxis_title="", yaxis_title="金额 (元)")
                 st.plotly_chart(fig_bar, use_container_width=True)
 
             st.markdown("---")
             
-            # 3. 展示原始数据表格
+            # 3. AI 报告
+            st.subheader("🤖 AI 财务总监诊断报告")
+            supplier_stats = df_history.groupby('销售方名称')['价税合计'].sum().sort_values(ascending=False).head(3)
+            top_suppliers_str = "，".join([f"{name}({amount}元)" for name, amount in supplier_stats.items()])
+            
+            if st.button("📝 一键生成本月财务诊断报告"):
+                with st.spinner("AI 正在分析账单并撰写报告..."):
+                    prompt = f"""
+                    你是一位资深的财务总监。请根据以下本月公司的发票台账汇总数据，给老板写一份简短的财务诊断报告（200字左右）。
+                    
+                    数据如下：
+                    - 发票总张数：{total_count} 张
+                    - 总支出金额：{total_amount:.2f} 元
+                    - 平均单张金额：{avg_amount:.2f} 元
+                    - 支出最多的前三大供应商（销售方）：{top_suppliers_str}
+                    
+                    报告要求：
+                    1. 语气专业、精炼，直接给出结论，不要废话。
+                    2. 分析支出结构（比如主要开销集中在哪些供应商）。
+                    3. 给出至少一条降本增效或财务合规的建议。
+                    """
+                    try:
+                        response = client.chat.completions.create(
+                            model="glm-4-flash",
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.4,
+                        )
+                        report = response.choices[0].message.content
+                        st.success(report)
+                    except Exception as e:
+                        st.error(f"报告生成失败：{e}")
+
+            st.markdown("---")
             st.write("**📋 数据库原始台账明细**")
             st.dataframe(df_history, use_container_width=True)
             
@@ -228,3 +256,81 @@ elif app_mode == "🗄️ 历史数据查询":
             st.warning("数据库里还没有数据，请先去上传发票！")
     except Exception as e:
         st.warning(f"读取数据库失败，请先识别发票。错误信息：{e}")
+
+# ==========================================
+# 模块四：流水智能分类
+# ==========================================
+elif app_mode == "📈 流水智能分类":
+    st.subheader("📈 银行/微信/支付宝流水智能分类")
+    st.info("💡 上传包含流水的 Excel。AI 将自动识别消费意图并打上标签（如：餐饮、交通、办公），存入数据库并生成消费占比图。")
+    
+    uploaded_excel = st.file_uploader("上传流水 Excel 文件", type=["xlsx", "xls", "csv"])
+    
+    if uploaded_excel is not None:
+        try:
+            if uploaded_excel.name.endswith('.csv'):
+                df_bank = pd.read_csv(uploaded_excel)
+            else:
+                df_bank = pd.read_excel(uploaded_excel)
+                
+            st.write("**数据预览：**")
+            st.dataframe(df_bank.head(5), use_container_width=True)
+            
+            columns = df_bank.columns.tolist()
+            default_remark_idx = next((i for i, col in enumerate(columns) if "备注" in col or "摘要" in col or "说明" in col), 0)
+            default_amount_idx = next((i for i, col in enumerate(columns) if "金额" in col or "支出" in col), 0)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                remark_col = st.selectbox("请选择【交易备注】列：", columns, index=default_remark_idx)
+            with col2:
+                amount_col = st.selectbox("请选择【金额】列：", columns, index=default_amount_idx)
+
+            if st.button("🚀 开始 AI 智能分类"):
+                with st.spinner("AI 正在分析消费意图..."):
+                    unique_remarks = df_bank[remark_col].astype(str).unique().tolist()
+                    unique_remarks = unique_remarks[:50] 
+                    
+                    prompt = f"""
+                    你是一个财务分类专家。请将以下交易备注分类到：['餐饮', '交通', '办公', '工资', '采购', '娱乐', '其他'] 中的一类。
+                    必须严格返回 JSON 字典格式，不要任何解释。例如：{{"星巴克": "餐饮", "滴滴打车": "交通"}}
+                    
+                    待分类列表：{unique_remarks}
+                    """
+                    
+                    try:
+                        response = client.chat.completions.create(
+                            model="glm-4-flash",
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.1,
+                        )
+                        raw_json = response.choices[0].message.content
+                        raw_json = re.sub(r'```json\s*', '', raw_json)
+                        raw_json = re.sub(r'```\s*', '', raw_json).strip()
+                        
+                        category_map = json.loads(raw_json)
+                        df_bank['AI分类'] = df_bank[remark_col].astype(str).map(category_map).fillna('其他')
+                        
+                        st.success("🎉 分类完成！")
+                        st.dataframe(df_bank[[remark_col, amount_col, 'AI分类']].head(10), use_container_width=True)
+                        
+                        try:
+                            conn = sqlite3.connect('finance.db')
+                            df_to_save = df_bank.rename(columns={remark_col: '交易备注', amount_col: '金额'})
+                            df_to_save[['交易备注', '金额', 'AI分类']].to_sql('transactions', conn, if_exists='append', index=False)
+                            conn.close()
+                            st.success("💾 分类数据已成功沉淀到数据库 (transactions 表)！")
+                        except Exception as e:
+                            st.error(f"存入数据库失败: {e}")
+                            
+                        st.markdown("---")
+                        st.write("**🍩 AI 消费结构分析**")
+                        chart_df = df_bank.groupby('AI分类')[amount_col].sum().reset_index()
+                        fig = px.pie(chart_df, values=amount_col, names='AI分类', hole=0.4)
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                    except Exception as e:
+                        st.error(f"AI 分类失败，错误信息：{e}")
+                        
+        except Exception as e:
+            st.error(f"读取文件失败，请确保文件格式正确。错误：{e}")

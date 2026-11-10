@@ -18,7 +18,15 @@ load_dotenv()
 st.set_page_config(page_title="财务 AI 助手", page_icon="💼", layout="wide")
 st.title("💼 财务 AI 智能分析与台账助手")
 
-client = ZhipuAI(api_key=os.getenv("ZHIPU_API_KEY"))
+# 智能获取密钥：优先从云端 Secrets 读，如果没有，再从本地 .env 读
+api_key = os.getenv("ZHIPU_API_KEY")
+if not api_key:
+    try:
+        api_key = st.secrets["ZHIPU_API_KEY"]
+    except Exception:
+        pass
+
+client = ZhipuAI(api_key=api_key)
 
 # ==========================================
 # 侧边栏：功能切换

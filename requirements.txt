@@ -3,8 +3,9 @@ pandas
 plotly
 zhipuai
 python-dotenv
-pypdf
+pdfplumber
 langchain-text-splitters
 langchain-community
 chromadb
 sentence-transformers
+openpyxl

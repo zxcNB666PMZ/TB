@@ -4,9 +4,10 @@ import json
 import re
 import pandas as pd
 import sqlite3
+from io import BytesIO
 from zhipuai import ZhipuAI
 from dotenv import load_dotenv
-from pypdf import PdfReader
+import pdfplumber
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -18,13 +19,18 @@ load_dotenv()
 st.set_page_config(page_title="财务 AI 助手", page_icon="💼", layout="wide")
 st.title("💼 财务 AI 智能分析与台账助手")
 
-# 智能获取密钥：优先从云端 Secrets 读，如果没有，再从本地 .env 读
+# 智能获取密钥：优先从本地 .env 读，如果没有，再去云端 Secrets 读
 api_key = os.getenv("ZHIPU_API_KEY")
 if not api_key:
     try:
-        api_key = st.secrets["ZHIPU_API_KEY"]
+        if "ZHIPU_API_KEY" in st.secrets:
+            api_key = st.secrets["ZHIPU_API_KEY"]
     except Exception:
         pass
+
+if not api_key:
+    st.error("🚨 致命错误：没有读取到 ZHIPU_API_KEY！请检查本地 .env 或云端 Secrets 配置。")
+    st.stop()
 
 client = ZhipuAI(api_key=api_key)
 
@@ -41,7 +47,7 @@ with st.sidebar:
     ])
 
 # ==========================================
-# 模块一：原有 RAG 问答模块
+# 模块一：RAG 问答模块
 # ==========================================
 if app_mode == "💬 财报文档问答 (RAG)":
     st.subheader("财报文档智能问答")
@@ -53,15 +59,20 @@ if app_mode == "💬 财报文档问答 (RAG)":
     if "messages" not in st.session_state:
         st.session_state.messages = [{"role": "assistant", "content": "你好！请在左侧上传财报 PDF，然后向我提问。"}]
     
+    # 使用 pdfplumber 解析 PDF
     if uploaded_file is not None and "vectorstore" not in st.session_state:
         with st.spinner("正在解析 PDF 并存入知识库..."):
-            reader = PdfReader(uploaded_file)
-            text = "".join([page.extract_text() for page in reader.pages if page.extract_text()])
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-            chunks = text_splitter.split_text(text)
-            embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
-            st.session_state.vectorstore = Chroma.from_texts(chunks, embeddings)
-            st.success("✅ 财报解析完成！")
+            try:
+                with pdfplumber.open(uploaded_file) as pdf:
+                    text = "".join([page.extract_text() or "" for page in pdf.pages])
+                
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+                chunks = text_splitter.split_text(text)
+                embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
+                st.session_state.vectorstore = Chroma.from_texts(chunks, embeddings)
+                st.success("✅ 财报解析完成！")
+            except Exception as e:
+                st.error(f"PDF解析失败: {e}")
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -112,8 +123,11 @@ elif app_mode == "🧾 批量发票识别台账":
         for i, file in enumerate(uploaded_invoices):
             text_content = ""
             if file.name.lower().endswith(".pdf"):
-                reader = PdfReader(file)
-                text_content = "".join([page.extract_text() for page in reader.pages if page.extract_text()])
+                try:
+                    with pdfplumber.open(file) as pdf:
+                        text_content = "".join([page.extract_text() or "" for page in pdf.pages])
+                except Exception:
+                    pass
             
             if not text_content:
                 st.warning(f"文件 {file.name} 解析失败或没有文字，已跳过。")
@@ -192,7 +206,6 @@ elif app_mode == "🗄️ 历史数据查询":
         if not df_history.empty:
             df_history['价税合计'] = pd.to_numeric(df_history['价税合计'], errors='coerce').fillna(0)
             
-            # 1. KPI 卡片
             col1, col2, col3 = st.columns(3)
             total_amount = df_history['价税合计'].sum()
             total_count = len(df_history)
@@ -204,7 +217,6 @@ elif app_mode == "🗄️ 历史数据查询":
             
             st.markdown("---")
             
-            # 2. 图表
             chart_col1, chart_col2 = st.columns(2)
             with chart_col1:
                 st.write("**🏢 供应商支出占比 (Top 10)**")
@@ -224,7 +236,6 @@ elif app_mode == "🗄️ 历史数据查询":
 
             st.markdown("---")
             
-            # 3. AI 报告
             st.subheader("🤖 AI 财务总监诊断报告")
             supplier_stats = df_history.groupby('销售方名称')['价税合计'].sum().sort_values(ascending=False).head(3)
             top_suppliers_str = "，".join([f"{name}({amount}元)" for name, amount in supplier_stats.items()])

@@ -10,4 +10,3 @@ chromadb
 sentence-transformers
 openpyxl
 supabase
-pdfplumber

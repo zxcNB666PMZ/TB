@@ -47,3 +47,5 @@ graph TD
     F -->|数据聚合| H[Plotly 交互式 BI 图表]
     G -->|SQL 查询| H
     H -->|展示| B
+🤖 核心亮点：AI Agent 架构
+项目不仅实现了基础的 RAG 问答，更基于 ReAct (Reasoning and Acting) 模式 实现了 AI Agent。大模型能够自主拆解任务，根据用户提问动态调用 query_invoice_db（云端数据库查询）和 calculator（计算器）工具，实现了从“静态问答”到“动态智能体”的跨越。

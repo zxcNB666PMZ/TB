@@ -243,7 +243,11 @@ if app_mode == "🤖 AI Agent 智能对话":
                                 if tool_name == "search_financial_report":
                                     result = search_financial_report(tool_args["query"])
                                 elif tool_name == "query_invoice_db":
-                                 result = query_invoice_db_via_mcp(tool_args["supplier_name"])
+                              # 判断当前环境：如果是云端，直接查库；如果是本地，走 MCP 网络请求
+if os.getenv("STREAMLIT_SHARING_MODE") or not os.getenv("LOCAL_MCP"):
+    result = query_invoice_db(tool_args["supplier_name"]) # 这个是咱们之前写的老函数，直接连数据库
+else:
+    result = query_invoice_db_via_mcp(tool_args["supplier_name"]) # 走你刚写的 MCP
                                 elif tool_name == "calculator":
                                     result = calculator(tool_args["expression"])
                                 else:

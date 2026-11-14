@@ -3,7 +3,6 @@ import os
 import json
 import re
 import pandas as pd
-from io import BytesIO
 from zhipuai import ZhipuAI
 from dotenv import load_dotenv
 import pdfplumber
@@ -48,10 +47,12 @@ def init_supabase() -> Client:
 supabase = init_supabase()
 
 # ==========================================
-# 🔒 登录鉴权拦截器 (核心防线)
+# 🔒 登录鉴权拦截器 (数据库版)
 # ==========================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
+    st.session_state.current_user = ""
+    st.session_state.current_role = ""
 
 if not st.session_state.logged_in:
     st.markdown("### 🔐 请先登录财务 AI 系统")
@@ -61,14 +62,25 @@ if not st.session_state.logged_in:
     password = st.text_input("密码", type="password")
     
     if st.button("登录"):
-        correct_user = get_secret("ADMIN_USERNAME")
-        correct_pass = get_secret("ADMIN_PASSWORD")
-        
-        if username == correct_user and password == correct_pass:
-            st.session_state.logged_in = True
-            st.rerun() 
-        else:
-            st.error("❌ 用户名或密码错误！")
+        try:
+            # 去 Supabase 的 users 表里查人
+            response = supabase.table("users").select("*").eq("username", username).execute()
+            
+            if response.data:
+                user_info = response.data[0]
+                # 核对密码（真实环境需加密）
+                if user_info.get("password") == password:
+                    st.session_state.logged_in = True
+                    st.session_state.current_user = user_info.get("username")
+                    st.session_state.current_role = user_info.get("role", "未知角色")
+                    st.success(f"欢迎回来，{st.session_state.current_role}！")
+                    st.rerun()
+                else:
+                    st.error("❌ 密码错误！")
+            else:
+                st.error("❌ 用户不存在！")
+        except Exception as e:
+            st.error(f"数据库查询失败，请检查 users 表和密钥: {e}")
             
     st.stop() # 没登录成功，后面的模块全部不执行！
 
@@ -77,9 +89,7 @@ if not st.session_state.logged_in:
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 功能菜单")
-    
-    # 显示当前用户
-    st.caption(f"👤 当前用户: {get_secret('ADMIN_USERNAME')}")
+    st.caption(f"👤 当前用户: {st.session_state.current_user} ({st.session_state.current_role})")
     
     app_mode = st.radio("请选择功能模块：", [
         "💬 财报文档问答 (RAG)", 
@@ -91,6 +101,8 @@ with st.sidebar:
     st.markdown("---")
     if st.button("🚪 退出登录", use_container_width=True):
         st.session_state.logged_in = False
+        st.session_state.current_user = ""
+        st.session_state.current_role = ""
         st.rerun()
 
 # ==========================================

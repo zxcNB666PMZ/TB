@@ -9,3 +9,5 @@ langchain-community
 chromadb
 sentence-transformers
 openpyxl
+supabase
+pdfplumber

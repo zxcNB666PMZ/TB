@@ -92,7 +92,7 @@ with st.sidebar:
     st.caption(f"👤 当前用户: {st.session_state.current_user} ({st.session_state.current_role})")
     
     app_mode = st.radio("请选择功能模块：", [
-        "🤖 AI Agent 智能对话", # 👈 升级为 Agent 模式
+        "🤖 AI Agent 智能对话", 
         "🧾 批量发票识别台账", 
         "🗄️ 历史数据查询", 
         "📈 流水智能分类"
@@ -113,25 +113,42 @@ def search_financial_report(query):
     docs = st.session_state.vectorstore.similarity_search(query, k=3)
     return "\n\n".join([doc.page_content for doc in docs])
 
+def query_invoice_db(supplier_name):
+    """工具2：降级版（云端直接连库，不通过MCP）"""
+    try:
+        response = supabase.table("invoices").select("价税合计").or_(
+            f"购买方名称.like.%{supplier_name}%,销售方名称.like.%{supplier_name}%"
+        ).execute()
+        if not response.data:
+            return f"数据库中没有找到关于 '{supplier_name}' 的发票记录。"
+        total = sum(float(item["价税合计"]) for item in response.data if item["价税合计"])
+        return f"查询到 '{supplier_name}' 的发票总金额为：{total} 元。"
+    except Exception as e:
+        return f"查询出错: {e}"
+
+def calculator(expression):
+    """工具3：计算器"""
+    try:
+        return str(eval(expression))
+    except Exception:
+        return "计算表达式错误"
+
 # 通过 MCP 协议请求后台服务器的工具
 async def call_mcp_query_invoice(supplier_name):
     try:
-        # 注意：这里连接的端口 8000 就是你刚刚启动的 mcp_server.py
         async with sse_client("http://127.0.0.1:8000/sse") as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
-                # 调用 MCP Server 上的 query_invoice_db 工具
                 result = await session.call_tool("query_invoice_db", {"supplier_name": supplier_name})
-                # 提取返回的文本内容
                 if result.content and len(result.content) > 0:
                     return result.content[0].text
                 return "没有返回结果"
     except Exception as e:
         return f"MCP 网络请求失败: {e}"
 
-# 包装一个同步版本，方便在 Streamlit 的 Agent 循环中直接调用
 def query_invoice_db_via_mcp(supplier_name):
     return asyncio.run(call_mcp_query_invoice(supplier_name))
+
 # 注册工具给大模型
 agent_tools = [
     {
@@ -196,18 +213,14 @@ if app_mode == "🤖 AI Agent 智能对话":
                 except Exception as e:
                     st.error(f"PDF解析失败: {e}")
 
-    # 初始化聊天记录
     if "agent_messages" not in st.session_state:
         st.session_state.agent_messages = [{"role": "assistant", "content": "你好！我是你的 AI 财务总监。我不仅能看财报，还能直接去数据库查你的发票，并帮你算账。你想让我做点什么？"}]
 
-    # 展示历史
     for msg in st.session_state.agent_messages:
-        # 过滤掉 tool 的历史（大模型不需要看，用户也不需要看）
         if msg["role"] in ["user", "assistant"]:
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
 
-    # 接收输入
     if prompt := st.chat_input("例如：查一下滴滴的发票总额，看看超没超预算..."):
         st.session_state.agent_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -216,10 +229,9 @@ if app_mode == "🤖 AI Agent 智能对话":
         with st.chat_message("assistant"):
             with st.spinner("AI 正在思考并调度工具..."):
                 
-                # 开始 Agent 循环
                 messages_to_send = st.session_state.agent_messages.copy()
                 
-                for step in range(5): # 最多允许思考 5 步
+                for step in range(5):
                     try:
                         response = client.chat.completions.create(
                             model="glm-4-flash",
@@ -229,7 +241,6 @@ if app_mode == "🤖 AI Agent 智能对话":
                         )
                         response_message = response.choices[0].message
                         
-                        # 如果 AI 决定调用工具
                         if response_message.tool_calls:
                             messages_to_send.append(response_message.model_dump())
                             
@@ -239,11 +250,15 @@ if app_mode == "🤖 AI Agent 智能对话":
                                 
                                 st.caption(f"🛠️ Agent 正在调用工具: `{tool_name}` ...")
                                 
-                                # 执行对应工具
+                                # 修复后的完美缩进
                                 if tool_name == "search_financial_report":
                                     result = search_financial_report(tool_args["query"])
                                 elif tool_name == "query_invoice_db":
-                                 result = query_invoice_db_via_mcp(tool_args["supplier_name"])
+                                    # 判断当前环境：如果是云端，直接查库；如果是本地，走 MCP 网络请求
+                                    if os.getenv("STREAMLIT_SHARING_MODE") or not os.getenv("LOCAL_MCP"):
+                                        result = query_invoice_db(tool_args["supplier_name"])
+                                    else:
+                                        result = query_invoice_db_via_mcp(tool_args["supplier_name"])
                                 elif tool_name == "calculator":
                                     result = calculator(tool_args["expression"])
                                 else:
@@ -251,14 +266,12 @@ if app_mode == "🤖 AI Agent 智能对话":
                                 
                                 st.caption(f"📦 工具返回结果: {result}")
                                 
-                                # 将结果还给 AI
                                 messages_to_send.append({
                                     "role": "tool",
                                     "tool_call_id": tool_call.id,
                                     "content": str(result)
                                 })
                         else:
-                            # AI 得出最终结论
                             final_answer = response_message.content
                             st.write(final_answer)
                             st.session_state.agent_messages.append({"role": "assistant", "content": final_answer})
@@ -268,7 +281,7 @@ if app_mode == "🤖 AI Agent 智能对话":
                         break
 
 # ==========================================
-# 模块二：发票识别 + 存入 Supabase 云端 (保持不变)
+# 模块二：发票识别 + 存入 Supabase 云端
 # ==========================================
 elif app_mode == "🧾 批量发票识别台账":
     st.subheader("一键提取发票信息并生成台账")
@@ -337,7 +350,7 @@ elif app_mode == "🧾 批量发票识别台账":
             st.download_button("📥 下载本次识别为 CSV", data=csv, file_name='本次发票台账.csv', mime='text/csv')
 
 # ==========================================
-# 模块三：历史数据查询 (保持不变)
+# 模块三：历史数据查询
 # ==========================================
 elif app_mode == "🗄️ 历史数据查询":
     st.subheader("📊 历史发票数据库与商业看板")
@@ -376,7 +389,7 @@ elif app_mode == "🗄️ 历史数据查询":
         st.warning(f"读取云端数据库失败: {e}")
 
 # ==========================================
-# 模块四：流水智能分类 (保持不变)
+# 模块四：流水智能分类
 # ==========================================
 elif app_mode == "📈 流水智能分类":
     st.subheader("📈 流水智能分类")

@@ -3,6 +3,7 @@ import os
 import json
 import re
 import pandas as pd
+from io import BytesIO
 from zhipuai import ZhipuAI
 from dotenv import load_dotenv
 import pdfplumber
@@ -40,7 +41,6 @@ if not api_key or not supabase_url:
 
 client = ZhipuAI(api_key=api_key)
 
-# 初始化 Supabase 客户端
 @st.cache_resource
 def init_supabase() -> Client:
     return create_client(supabase_url, supabase_key)
@@ -48,16 +48,50 @@ def init_supabase() -> Client:
 supabase = init_supabase()
 
 # ==========================================
+# 🔒 登录鉴权拦截器 (核心防线)
+# ==========================================
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if not st.session_state.logged_in:
+    st.markdown("### 🔐 请先登录财务 AI 系统")
+    st.info("为了保护财务数据安全，请验证您的身份。")
+    
+    username = st.text_input("用户名")
+    password = st.text_input("密码", type="password")
+    
+    if st.button("登录"):
+        correct_user = get_secret("ADMIN_USERNAME")
+        correct_pass = get_secret("ADMIN_PASSWORD")
+        
+        if username == correct_user and password == correct_pass:
+            st.session_state.logged_in = True
+            st.rerun() 
+        else:
+            st.error("❌ 用户名或密码错误！")
+            
+    st.stop() # 没登录成功，后面的模块全部不执行！
+
+# ==========================================
 # 侧边栏：功能切换
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 功能菜单")
+    
+    # 显示当前用户
+    st.caption(f"👤 当前用户: {get_secret('ADMIN_USERNAME')}")
+    
     app_mode = st.radio("请选择功能模块：", [
         "💬 财报文档问答 (RAG)", 
         "🧾 批量发票识别台账", 
         "🗄️ 历史数据查询", 
         "📈 流水智能分类"
     ])
+    
+    st.markdown("---")
+    if st.button("🚪 退出登录", use_container_width=True):
+        st.session_state.logged_in = False
+        st.rerun()
 
 # ==========================================
 # 模块一：RAG 问答模块
@@ -187,7 +221,6 @@ elif app_mode == "🧾 批量发票识别台账":
             
             st.dataframe(df, use_container_width=True)
             
-            # 存入 Supabase
             try:
                 records = df.to_dict(orient="records")
                 supabase.table("invoices").insert(records).execute()
@@ -206,7 +239,6 @@ elif app_mode == "🗄️ 历史数据查询":
     st.info("这里展示的是所有已存入 Supabase 云端的发票数据。")
     
     try:
-        # 从 Supabase 读取
         response = supabase.table("invoices").select("*").execute()
         data = response.data
         
@@ -274,7 +306,7 @@ elif app_mode == "🗄️ 历史数据查询":
         else:
             st.warning("云端数据库里还没有数据，请先去上传发票！")
     except Exception as e:
-        st.warning(f"读取云端数据库失败，请检查密钥配置。错误信息：{e}")
+        st.warning(f"读取云端数据库失败: {e}")
 
 # ==========================================
 # 模块四：流水智能分类 (存入 Supabase)
@@ -322,7 +354,6 @@ elif app_mode == "📈 流水智能分类":
                         st.success("🎉 分类完成！")
                         st.dataframe(df_bank[[remark_col, amount_col, 'AI分类']].head(10), use_container_width=True)
                         
-                        # 存入 Supabase
                         try:
                             df_to_save = df_bank.rename(columns={remark_col: '交易备注', amount_col: '金额'})
                             records = df_to_save[['交易备注', '金额', 'AI分类']].to_dict(orient="records")
@@ -340,4 +371,4 @@ elif app_mode == "📈 流水智能分类":
                     except Exception as e:
                         st.error(f"AI 分类失败，错误信息：{e}")
         except Exception as e:
-            st.error(f"读取文件失败，请确保文件格式正确。错误：{e}")
+            st.error(f"读取文件失败: {e}")

@@ -29,7 +29,8 @@
 ### 4. 📈 银行/微信/支付宝流水智能分类
 - 上传杂乱无章的流水 Excel。
 - 利用 AI 对“交易备注”进行语义理解，自动打上（餐饮、交通、办公等）分类标签。
-- 使用原生 SQL 与 `Pandas` 处理数据，直观展示个人/企业消费结构。
+- 使用原生 SQL 与 `Pandas` 处理数据，直观展示个人/企业消费结构。<img width="1280" height="691" alt="bec4aa6b0fd31cd5de5da3a95288aaea" src="https://github.com/user-attachments/assets/b9cf642b-d610-468b-bd19-7d8ca86b2413" />
+
 
 ---
 

@@ -1,3 +1,8 @@
+import nest_asyncio
+nest_asyncio.apply()
+import asyncio
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 import streamlit as st
 import os
 import json
@@ -108,26 +113,25 @@ def search_financial_report(query):
     docs = st.session_state.vectorstore.similarity_search(query, k=3)
     return "\n\n".join([doc.page_content for doc in docs])
 
-def query_invoice_db(supplier_name):
-    """工具2：去 Supabase 云数据库查发票金额（同时匹配购买方和销售方）"""
+# 通过 MCP 协议请求后台服务器的工具
+async def call_mcp_query_invoice(supplier_name):
     try:
-        # 🌟 关键升级：用 or_ 同时查询购买方和销售方，防止因为你是购买方而查不到滴滴
-        response = supabase.table("invoices").select("价税合计").or_(f"购买方名称.like.%{supplier_name}%,销售方名称.like.%{supplier_name}%").execute()
-        
-        if not response.data:
-            return f"数据库中没有找到关于 '{supplier_name}' 的发票记录。"
-        
-        total = sum(float(item["价税合计"]) for item in response.data if item["价税合计"])
-        return f"查询到 {supplier_name} 的发票总金额为：{total} 元。"
+        # 注意：这里连接的端口 8000 就是你刚刚启动的 mcp_server.py
+        async with sse_client("http://127.0.0.1:8000/sse") as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                # 调用 MCP Server 上的 query_invoice_db 工具
+                result = await session.call_tool("query_invoice_db", {"supplier_name": supplier_name})
+                # 提取返回的文本内容
+                if result.content and len(result.content) > 0:
+                    return result.content[0].text
+                return "没有返回结果"
     except Exception as e:
-        return f"数据库查询出错: {e}"
-def calculator(expression):
-    """工具3：计算器"""
-    try:
-        return str(eval(expression))
-    except Exception:
-        return "计算表达式错误"
+        return f"MCP 网络请求失败: {e}"
 
+# 包装一个同步版本，方便在 Streamlit 的 Agent 循环中直接调用
+def query_invoice_db_via_mcp(supplier_name):
+    return asyncio.run(call_mcp_query_invoice(supplier_name))
 # 注册工具给大模型
 agent_tools = [
     {
@@ -239,7 +243,7 @@ if app_mode == "🤖 AI Agent 智能对话":
                                 if tool_name == "search_financial_report":
                                     result = search_financial_report(tool_args["query"])
                                 elif tool_name == "query_invoice_db":
-                                    result = query_invoice_db(tool_args["supplier_name"])
+                                 result = query_invoice_db_via_mcp(tool_args["supplier_name"])
                                 elif tool_name == "calculator":
                                     result = calculator(tool_args["expression"])
                                 else:

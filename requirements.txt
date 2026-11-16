@@ -9,5 +9,6 @@ langchain-community
 chromadb
 sentence-transformers
 supabase
-mcp<2.0.0
+mcp>=1.0.0,<2.0.0
 nest_asyncio
+pydantic>=2.5.0,<2.14.0

@@ -10,5 +10,5 @@ chromadb
 sentence-transformers
 openpyxl
 supabase
-mcp
+mcp<2.0.0
 nest_asyncio

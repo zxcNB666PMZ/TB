@@ -3,6 +3,7 @@ import os
 import json
 import re
 import pandas as pd
+import httpx
 from zhipuai import ZhipuAI
 from dotenv import load_dotenv
 import pdfplumber
@@ -10,13 +11,13 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 import plotly.express as px
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 load_dotenv()
 
 st.set_page_config(page_title="财务 AI 助手", page_icon="💼", layout="wide")
-st.title("💼 财务 AI 智能分析与台账助手 (云端版)")
+st.title("💼 财务 AI 智能分析与台账助手")
 
 # ==========================================
 # 智能读取配置
@@ -35,16 +36,18 @@ supabase_url = get_secret("SUPABASE_URL")
 supabase_key = get_secret("SUPABASE_KEY")
 
 if not api_key or not supabase_url:
-    st.error("🚨 致命错误：未读取到 API 或 数据库密钥！请检查云端 Secrets。")
+    st.error("🚨 致命错误：未读取到 API 或 数据库密钥！请检查本地 .env 或云端 Secrets。")
     st.stop()
 
 client = ZhipuAI(api_key=api_key)
 
-# 最原始、最稳定的连接方式，彻底清理可能存在的斜杠
+# 最稳定的直连方式，防止 404 串线
 @st.cache_resource
 def init_supabase() -> Client:
     clean_url = supabase_url.strip().rstrip("/")
-    return create_client(clean_url, supabase_key)
+    httpx_client = httpx.Client(base_url=f"{clean_url}/rest/v1/", http2=False)
+    options = ClientOptions(httpx_client=httpx_client)
+    return create_client(clean_url, supabase_key, options=options)
 
 supabase = init_supabase()
 
@@ -101,7 +104,7 @@ with st.sidebar:
         st.rerun()
 
 # ==========================================
-# 工具函数 (云端直连版)
+# 工具函数 (纯本地直连)
 # ==========================================
 def search_financial_report(query):
     if "vectorstore" not in st.session_state:
@@ -110,7 +113,6 @@ def search_financial_report(query):
     return "\n\n".join([doc.page_content for doc in docs])
 
 def query_invoice_db(supplier_name):
-    """云端直接连库查账"""
     try:
         response = supabase.table("invoices").select("价税合计").or_(
             f"购买方名称.like.%{supplier_name}%,销售方名称.like.%{supplier_name}%"
@@ -139,7 +141,6 @@ agent_tools = [
 # ==========================================
 if app_mode == "🤖 AI Agent 智能对话":
     st.subheader("🤖 AI 财务总监 (Agent 模式)")
-    st.info("💡 试试问我：'帮我查一下滴滴的发票总额，如果上限是1000元，还能报多少？'")
     
     with st.sidebar:
         st.markdown("---")
@@ -191,7 +192,6 @@ if app_mode == "🤖 AI Agent 智能对话":
                                 if tool_name == "search_financial_report":
                                     result = search_financial_report(tool_args["query"])
                                 elif tool_name == "query_invoice_db":
-                                    # 云端直接直连
                                     result = query_invoice_db(tool_args["supplier_name"])
                                 elif tool_name == "calculator":
                                     result = calculator(tool_args["expression"])

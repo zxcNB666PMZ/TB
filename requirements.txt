@@ -8,5 +8,4 @@ langchain-text-splitters
 langchain-community
 chromadb
 sentence-transformers
-supabase==2.3.4
-nest_asyncio
+supabase

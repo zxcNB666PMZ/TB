@@ -1,10 +1,19 @@
+import os
+import asyncio
 import nest_asyncio
 nest_asyncio.apply()
-import asyncio
-from mcp import ClientSession
-from mcp.client.sse import sse_client
+
+# 🚨 核心修复 1：按需导入 MCP，云端不报错
+MCP_AVAILABLE = False
+if os.getenv("LOCAL_MCP") == "True":
+    try:
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
+        MCP_AVAILABLE = True
+    except ImportError:
+        pass
+
 import streamlit as st
-import os
 import json
 import re
 import pandas as pd
@@ -15,7 +24,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 import plotly.express as px
-from supabase import create_client, Client
+import httpx
+from supabase import create_client, Client, ClientOptions
 
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 load_dotenv()
@@ -45,9 +55,13 @@ if not api_key or not supabase_url:
 
 client = ZhipuAI(api_key=api_key)
 
+# 🚨 核心修复 2：隔离 Supabase 客户端，彻底解决 404 串线 Bug
 @st.cache_resource
 def init_supabase() -> Client:
-    return create_client(supabase_url, supabase_key)
+    clean_url = supabase_url.rstrip("/")
+    httpx_client = httpx.Client(base_url=f"{clean_url}/rest/v1/")
+    options = ClientOptions(httpx_client=httpx_client)
+    return create_client(clean_url, supabase_key, options=options)
 
 supabase = init_supabase()
 
@@ -107,14 +121,12 @@ with st.sidebar:
 # 定义 Agent 的工具函数
 # ==========================================
 def search_financial_report(query):
-    """工具1：去本地向量库查财报"""
     if "vectorstore" not in st.session_state:
         return "当前用户尚未上传任何财报 PDF，无法查询。"
     docs = st.session_state.vectorstore.similarity_search(query, k=3)
     return "\n\n".join([doc.page_content for doc in docs])
 
 def query_invoice_db(supplier_name):
-    """工具2：降级版（云端直接连库，不通过MCP）"""
     try:
         response = supabase.table("invoices").select("价税合计").or_(
             f"购买方名称.like.%{supplier_name}%,销售方名称.like.%{supplier_name}%"
@@ -127,14 +139,14 @@ def query_invoice_db(supplier_name):
         return f"查询出错: {e}"
 
 def calculator(expression):
-    """工具3：计算器"""
     try:
         return str(eval(expression))
     except Exception:
         return "计算表达式错误"
 
-# 通过 MCP 协议请求后台服务器的工具
 async def call_mcp_query_invoice(supplier_name):
+    if not MCP_AVAILABLE:
+        return "MCP服务未启用（云端自动降级直连）"
     try:
         async with sse_client("http://127.0.0.1:8000/sse") as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
@@ -149,18 +161,13 @@ async def call_mcp_query_invoice(supplier_name):
 def query_invoice_db_via_mcp(supplier_name):
     return asyncio.run(call_mcp_query_invoice(supplier_name))
 
-# 注册工具给大模型
 agent_tools = [
     {
         "type": "function",
         "function": {
             "name": "search_financial_report",
             "description": "当用户询问关于财报、年报、文档内容时，使用此工具检索财报文本。",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string", "description": "搜索关键词"}},
-                "required": ["query"]
-            }
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
         }
     },
     {
@@ -168,23 +175,15 @@ agent_tools = [
         "function": {
             "name": "query_invoice_db",
             "description": "当用户询问某个供应商、公司的发票总金额、台账记录时，使用此工具。",
-            "parameters": {
-                "type": "object",
-                "properties": {"supplier_name": {"type": "string", "description": "供应商或购买方名称，如滴滴"}},
-                "required": ["supplier_name"]
-            }
+            "parameters": {"type": "object", "properties": {"supplier_name": {"type": "string"}}, "required": ["supplier_name"]}
         }
     },
     {
         "type": "function",
         "function": {
             "name": "calculator",
-            "description": "当需要进行数学计算（如加减乘除、报销额度计算）时，使用此工具。",
-            "parameters": {
-                "type": "object",
-                "properties": {"expression": {"type": "string", "description": "数学表达式，如 1000-800"}},
-                "required": ["expression"]
-            }
+            "description": "当需要进行数学计算时使用此工具。",
+            "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}
         }
     }
 ]
@@ -199,7 +198,7 @@ if app_mode == "🤖 AI Agent 智能对话":
     with st.sidebar:
         st.markdown("---")
         st.header("📂 财报知识库")
-        uploaded_file = st.file_uploader("上传财务 PDF 报告 (供 Agent 检索)", type=["pdf"])
+        uploaded_file = st.file_uploader("上传财务 PDF 报告", type=["pdf"])
         if uploaded_file is not None and "vectorstore" not in st.session_state:
             with st.spinner("正在解析财报..."):
                 try:
@@ -209,26 +208,25 @@ if app_mode == "🤖 AI Agent 智能对话":
                     chunks = text_splitter.split_text(text)
                     embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
                     st.session_state.vectorstore = Chroma.from_texts(chunks, embeddings)
-                    st.success("✅ 财报已入库，Agent 可随时检索！")
+                    st.success("✅ 财报已入库！")
                 except Exception as e:
                     st.error(f"PDF解析失败: {e}")
 
     if "agent_messages" not in st.session_state:
-        st.session_state.agent_messages = [{"role": "assistant", "content": "你好！我是你的 AI 财务总监。我不仅能看财报，还能直接去数据库查你的发票，并帮你算账。你想让我做点什么？"}]
+        st.session_state.agent_messages = [{"role": "assistant", "content": "你好！我是你的 AI 财务总监。我不仅能看财报，还能直接去数据库查你的发票。"}]
 
     for msg in st.session_state.agent_messages:
         if msg["role"] in ["user", "assistant"]:
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
 
-    if prompt := st.chat_input("例如：查一下滴滴的发票总额，看看超没超预算..."):
+    if prompt := st.chat_input("例如：查一下滴滴的发票总额..."):
         st.session_state.agent_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("AI 正在思考并调度工具..."):
-                
+            with st.spinner("AI 正在思考..."):
                 messages_to_send = st.session_state.agent_messages.copy()
                 
                 for step in range(5):
@@ -250,11 +248,10 @@ if app_mode == "🤖 AI Agent 智能对话":
                                 
                                 st.caption(f"🛠️ Agent 正在调用工具: `{tool_name}` ...")
                                 
-                                # 修复后的完美缩进
                                 if tool_name == "search_financial_report":
                                     result = search_financial_report(tool_args["query"])
                                 elif tool_name == "query_invoice_db":
-                                    # 判断当前环境：如果是云端，直接查库；如果是本地，走 MCP 网络请求
+                                    # 云端自动降级直连，本地走 MCP
                                     if os.getenv("STREAMLIT_SHARING_MODE") or not os.getenv("LOCAL_MCP"):
                                         result = query_invoice_db(tool_args["supplier_name"])
                                     else:

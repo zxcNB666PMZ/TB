@@ -1,19 +1,5 @@
-import os
-import asyncio
-import nest_asyncio
-nest_asyncio.apply()
-
-# 🚨 核心修复 1：按需导入 MCP，云端不报错
-MCP_AVAILABLE = False
-if os.getenv("LOCAL_MCP") == "True":
-    try:
-        from mcp import ClientSession
-        from mcp.client.sse import sse_client
-        MCP_AVAILABLE = True
-    except ImportError:
-        pass
-
 import streamlit as st
+import os
 import json
 import re
 import pandas as pd
@@ -24,14 +10,13 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 import plotly.express as px
-import httpx
-from supabase import create_client, Client, ClientOptions
+from supabase import create_client, Client
 
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 load_dotenv()
 
 st.set_page_config(page_title="财务 AI 助手", page_icon="💼", layout="wide")
-st.title("💼 财务 AI 智能分析与台账助手")
+st.title("💼 财务 AI 智能分析与台账助手 (云端版)")
 
 # ==========================================
 # 智能读取配置
@@ -50,23 +35,21 @@ supabase_url = get_secret("SUPABASE_URL")
 supabase_key = get_secret("SUPABASE_KEY")
 
 if not api_key or not supabase_url:
-    st.error("🚨 致命错误：未读取到 API 或 数据库密钥！请检查本地 .env 或云端 Secrets。")
+    st.error("🚨 致命错误：未读取到 API 或 数据库密钥！请检查云端 Secrets。")
     st.stop()
 
 client = ZhipuAI(api_key=api_key)
 
-# 🚨 核心修复 2：隔离 Supabase 客户端，彻底解决 404 串线 Bug
+# 最原始、最稳定的连接方式，彻底清理可能存在的斜杠
 @st.cache_resource
 def init_supabase() -> Client:
-    clean_url = supabase_url.rstrip("/")
-    httpx_client = httpx.Client(base_url=f"{clean_url}/rest/v1/")
-    options = ClientOptions(httpx_client=httpx_client)
-    return create_client(clean_url, supabase_key, options=options)
+    clean_url = supabase_url.strip().rstrip("/")
+    return create_client(clean_url, supabase_key)
 
 supabase = init_supabase()
 
 # ==========================================
-# 🔒 登录鉴权拦截器 (数据库版)
+# 🔒 登录鉴权拦截器
 # ==========================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -99,7 +82,7 @@ if not st.session_state.logged_in:
     st.stop() 
 
 # ==========================================
-# 侧边栏：功能切换
+# 侧边栏
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 功能菜单")
@@ -118,7 +101,7 @@ with st.sidebar:
         st.rerun()
 
 # ==========================================
-# 定义 Agent 的工具函数
+# 工具函数 (云端直连版)
 # ==========================================
 def search_financial_report(query):
     if "vectorstore" not in st.session_state:
@@ -127,6 +110,7 @@ def search_financial_report(query):
     return "\n\n".join([doc.page_content for doc in docs])
 
 def query_invoice_db(supplier_name):
+    """云端直接连库查账"""
     try:
         response = supabase.table("invoices").select("价税合计").or_(
             f"购买方名称.like.%{supplier_name}%,销售方名称.like.%{supplier_name}%"
@@ -144,52 +128,14 @@ def calculator(expression):
     except Exception:
         return "计算表达式错误"
 
-async def call_mcp_query_invoice(supplier_name):
-    if not MCP_AVAILABLE:
-        return "MCP服务未启用（云端自动降级直连）"
-    try:
-        async with sse_client("http://127.0.0.1:8000/sse") as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                result = await session.call_tool("query_invoice_db", {"supplier_name": supplier_name})
-                if result.content and len(result.content) > 0:
-                    return result.content[0].text
-                return "没有返回结果"
-    except Exception as e:
-        return f"MCP 网络请求失败: {e}"
-
-def query_invoice_db_via_mcp(supplier_name):
-    return asyncio.run(call_mcp_query_invoice(supplier_name))
-
 agent_tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_financial_report",
-            "description": "当用户询问关于财报、年报、文档内容时，使用此工具检索财报文本。",
-            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_invoice_db",
-            "description": "当用户询问某个供应商、公司的发票总金额、台账记录时，使用此工具。",
-            "parameters": {"type": "object", "properties": {"supplier_name": {"type": "string"}}, "required": ["supplier_name"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculator",
-            "description": "当需要进行数学计算时使用此工具。",
-            "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}
-        }
-    }
+    {"type": "function", "function": {"name": "search_financial_report", "description": "检索财报", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "query_invoice_db", "description": "查发票金额", "parameters": {"type": "object", "properties": {"supplier_name": {"type": "string"}}, "required": ["supplier_name"]}}},
+    {"type": "function", "function": {"name": "calculator", "description": "计算器", "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}}}
 ]
 
 # ==========================================
-# 模块一：AI Agent 智能对话
+# 模块一：AI Agent
 # ==========================================
 if app_mode == "🤖 AI Agent 智能对话":
     st.subheader("🤖 AI 财务总监 (Agent 模式)")
@@ -198,7 +144,7 @@ if app_mode == "🤖 AI Agent 智能对话":
     with st.sidebar:
         st.markdown("---")
         st.header("📂 财报知识库")
-        uploaded_file = st.file_uploader("上传财务 PDF 报告", type=["pdf"])
+        uploaded_file = st.file_uploader("上传财务 PDF", type=["pdf"])
         if uploaded_file is not None and "vectorstore" not in st.session_state:
             with st.spinner("正在解析财报..."):
                 try:
@@ -228,46 +174,32 @@ if app_mode == "🤖 AI Agent 智能对话":
         with st.chat_message("assistant"):
             with st.spinner("AI 正在思考..."):
                 messages_to_send = st.session_state.agent_messages.copy()
-                
                 for step in range(5):
                     try:
                         response = client.chat.completions.create(
-                            model="glm-4-flash",
-                            messages=messages_to_send,
-                            tools=agent_tools,
-                            tool_choice="auto"
+                            model="glm-4-flash", messages=messages_to_send, tools=agent_tools, tool_choice="auto"
                         )
                         response_message = response.choices[0].message
                         
                         if response_message.tool_calls:
                             messages_to_send.append(response_message.model_dump())
-                            
                             for tool_call in response_message.tool_calls:
                                 tool_name = tool_call.function.name
                                 tool_args = json.loads(tool_call.function.arguments)
-                                
                                 st.caption(f"🛠️ Agent 正在调用工具: `{tool_name}` ...")
                                 
                                 if tool_name == "search_financial_report":
                                     result = search_financial_report(tool_args["query"])
                                 elif tool_name == "query_invoice_db":
-                                    # 云端自动降级直连，本地走 MCP
-                                    if os.getenv("STREAMLIT_SHARING_MODE") or not os.getenv("LOCAL_MCP"):
-                                        result = query_invoice_db(tool_args["supplier_name"])
-                                    else:
-                                        result = query_invoice_db_via_mcp(tool_args["supplier_name"])
+                                    # 云端直接直连
+                                    result = query_invoice_db(tool_args["supplier_name"])
                                 elif tool_name == "calculator":
                                     result = calculator(tool_args["expression"])
                                 else:
                                     result = "未知工具"
                                 
                                 st.caption(f"📦 工具返回结果: {result}")
-                                
-                                messages_to_send.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": str(result)
-                                })
+                                messages_to_send.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(result)})
                         else:
                             final_answer = response_message.content
                             st.write(final_answer)
@@ -278,7 +210,7 @@ if app_mode == "🤖 AI Agent 智能对话":
                         break
 
 # ==========================================
-# 模块二：发票识别 + 存入 Supabase 云端
+# 模块二：发票识别
 # ==========================================
 elif app_mode == "🧾 批量发票识别台账":
     st.subheader("一键提取发票信息并生成台账")

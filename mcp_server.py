@@ -2,6 +2,7 @@ from mcp.server.mcpserver import MCPServer
 from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
+from feishu_reader import read_document
 
 # 加载你本地的密钥
 load_dotenv()
@@ -31,6 +32,12 @@ def query_invoice_db(supplier_name: str) -> str:
         return f"查询到 '{supplier_name}' 的发票总金额为：{total} 元。"
     except Exception as e:
         return f"查询出错: {e}"
+
+@mcp.tool()
+def read_feishu_document(document_url_or_id: str) -> str:
+    """读取用户提供的飞书 /docx/ 或 /wiki/ 文档链接的正文。仅查询，不修改文档。"""
+    return read_document(document_url_or_id)
+
 
 if __name__ == "__main__":
     # 以 SSE 模式启动

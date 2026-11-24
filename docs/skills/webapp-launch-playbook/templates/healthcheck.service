@@ -1,0 +1,10 @@
+﻿[Unit]
+Description=App healthcheck
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/app
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-/opt/app/.env
+ExecStart=/opt/app/.venv/bin/python /opt/app/healthcheck.py

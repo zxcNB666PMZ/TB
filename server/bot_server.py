@@ -259,7 +259,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         if not question:
             return
 
-        print(f"[{time.strftime('%H:%M:%S')}] 收到: {question}", flush=True)
+        print(f"[{time.strftime('%H:%M:%S')}] 收到(chat_id={chat_id}): {question}", flush=True)
         try:
             answer = _chat(chat_id, question)
         except Exception as exc:

@@ -123,6 +123,16 @@ systemctl daemon-reload && systemctl enable --now finance-ai finance-bot
 
 ## 🔧 运维
 
+**一键状态总览（推荐）：**
+
+```bash
+bash /opt/finance-ai/status.sh
+```
+
+输出服务状态、下次健康检查时间、最近检查记录、数据库统计、内存磁盘、网页可达性。
+
+**常用命令：**
+
 ```bash
 systemctl status finance-ai finance-bot    # 状态
 systemctl restart finance-ai               # 改代码后重启

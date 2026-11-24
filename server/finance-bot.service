@@ -1,0 +1,17 @@
+[Unit]
+Description=Feishu Finance Bot (long connection)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/finance-ai
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-/opt/finance-ai/.env
+ExecStart=/opt/finance-ai/.venv/bin/python /opt/finance-ai/bot_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

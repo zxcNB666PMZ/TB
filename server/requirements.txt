@@ -1,0 +1,12 @@
+streamlit
+zhipuai
+python-dotenv
+psycopg2-binary
+pdfplumber
+pandas
+plotly
+langchain-text-splitters
+langchain-huggingface
+langchain-chroma
+mcp
+requests

@@ -1,65 +1,206 @@
-# 💼 财务 AI 智能分析与台账助手 (Full-Stack AI Agent)
+# 💼 财务 AI 智能分析助手
 
-> 一个基于大语言模型 (LLM)、RAG 检索增强生成、ReAct Agent 架构与 MCP 微服务协议构建的企业级全栈财务应用。
+> 基于大语言模型（智谱 GLM）、ReAct Agent 与 PostgreSQL 的企业财务自动化系统。
+> 支持**批量发票识别**、**台账查询**、**BI 看板**、**飞书机器人对话**与**财报问答**。
 
-## 📖 项目简介 (Introduction)
-传统财务工作中，长篇幅财报的阅读效率极低，且海量发票的手动录入极易出错。本项目旨在打造一个**“全自动 AI 财务中台”**，通过接入智谱 GLM 大模型，实现财报文档的精准问答、发票信息的自动化提取、结构化沉淀，以及**具备自主规划能力的 Agent 智能体**。
-
-🔗 **在线体验 (Live Demo):** [https://mengzhan.streamlit.app](https://mengzhan.streamlit.app)
-*(测试账号：`admin` / 密码：`123456` 或 `finance` / `888888`)*
+**🟢 线上地址：** <http://8.140.220.172:8501>
+**💬 飞书机器人：** 飞书内搜索「TB 机器人」直接对话
 
 ---
 
-## ✨ 核心功能与高阶架构 (Key Features & Architecture)
+## ✨ 核心功能
 
-### 1. 🤖 基于 ReAct 架构的 AI Agent 智能体
-- **自主任务拆解**：大模型不仅会聊天，还能根据用户提问（如“帮我查滴滴发票并算算还能报多少”），自主拆解为“查库”与“计算”两步。
-- **Function Calling (工具调用)**：手搓 ReAct 循环。AI 能动态调用 `query_invoice_db`（云库查询）和 `calculator`（计算器）工具，并整合结果输出。
-- **多轮对话记忆**：基于 Streamlit Session State 维护上下文。
-
-### 2. 🔌 MCP (Model Context Protocol) 微服务解耦
-- **Tool-as-a-Service**：将数据库查询能力封装为独立的 `mcp_server.py` 服务。
-- **SSE 网络通信**：前端 Agent 通过 Server-Sent Events 协议与 MCP 工具服务进行异步通信，实现了工具与业务逻辑的彻底解耦。
-- **多环境自适应降级**：通过环境变量控制，本地开发环境走 MCP 网络调用（展示微服务架构）；云端 Serverless 环境自动降级为直连数据库，保证云端 100% 稳定。
-
-### 3. 🔒 企业级多用户鉴权与数据隔离
-- **云端鉴权**：抛弃本地环境变量，全面接入 **Supabase PostgreSQL** 进行动态多用户账号密码校验。
-- **角色管理**：支持不同角色（超级管理员、财务总监）登录，并在侧边栏动态展示当前身份。
-- **安全防护**：前端拦截器强制拦截未登录请求，防止大模型 API 被恶意消耗。
-
-### 4. 💬 RAG 财报文档智能问答
-- 上传动辄上百页的财务 PDF，系统通过 `pdfplumber` 精准提取文本。
-- 利用 LangChain 切片，结合 HuggingFace 中文向量模型 (`bge-small-zh`) 构建本地知识库 (ChromaDB)。
-- 严格限制 AI 基于检索到的上下文回答，有效解决财务领域的“幻觉”问题。
-
-### 5. 🧾 批量发票识别与台账
-- 借助 Prompt Engineering，强制大模型以严格的 JSON 格式输出发票字段。
-- 彻底解放财务人员的双手，替代传统低效的手动录入。
-
-### 6. 📊 商业 BI 看板与智能诊断
-- 数据无缝接入 Supabase 云数据库，使用 `Pandas` 清洗，`Plotly` 动态绘制供应商支出环形图与开票趋势柱状图。
-- **AI 财务总监诊断报告**：将汇总数据喂给大模型，一键生成“降本增效”的高管级建议。
-
-### 7. 📈 流水智能分类
-- 上传流水 Excel，利用 AI 对“交易备注”进行语义理解，自动打上分类标签，生成消费结构饼图。
+| 模块 | 说明 |
+|---|---|
+| 🧾 **批量发票识别** | 上传电子发票 PDF，GLM 自动抽取发票号码 / 日期 / 购销方 / 金额，按发票号码去重入库 |
+| 🗄️ **历史台账** | 全部发票结构化展示，支持按公司、日期筛选 |
+| 📊 **BI 看板** | Plotly 交互图表：供应商支出占比、开票趋势、月度汇总 |
+| 🤖 **AI 财务 Agent** | ReAct 循环 + Function Calling，自主调用数据库查询、计算器、飞书文档读取 |
+| 💬 **飞书机器人** | 长连接接入飞书，同事在飞书里直接问「滴滴花了多少」→ 实时查库回答 |
+| 📈 **流水智能分类** | 上传银行/微信/支付宝流水 Excel，AI 按备注语义自动打标签 |
+| 📚 **财报问答（可选）** | 上传财报 PDF 构建向量库，Agent 检索后回答（需向量模型，2G 内存机器默认关闭） |
 
 ---
 
-## 🏗️ 系统架构图 (Architecture)
+## 🏗️ 系统架构
 
 ```mermaid
 graph TD
-    A["用户 (Web/Mobile)"] -->|"登录/上传/提问"| B["Streamlit 前端 & 鉴权拦截器"]
-    B -->|"发送对话"| C["智谱 GLM-4 (Agent大脑)"]
-    C -->|"决定调用工具"| D["ReAct 循环控制器"]
-    
-    D -->|"本地环境 (SSE 协议)"| E["MCP Server 微服务 (Port 8000)"]
-    D -->|"云端环境 (降级直连)"| F[("Supabase PostgreSQL 云数据库")]
-    E -->|"SQL 查询"| F
-    
-    F -->|"返回结构化数据"| D
-    D -->|"工具结果注入"| C
-    C -->|"最终回答"| B
-    
-    B -->|"PDF解析"| G["pdfplumber + ChromaDB (RAG)"]
-    B -->|"数据可视化"| H["Pandas + Plotly BI 看板"]
+    U1[浏览器] -->|8501| WEB[Streamlit 网页]
+    U2[飞书客户端] -->|长连接| BOT[飞书机器人]
+    WEB --> AGENT[ReAct Agent]
+    BOT --> TZ[智谱 GLM-4-Flash]
+    AGENT --> TZ
+    AGENT -->|Function Call| DB[(PostgreSQL)]
+    BOT -->|Function Call| DB
+    WEB -->|pdfplumber| PDF[发票 PDF]
+    DB --> CHART[Plotly 图表]
+    CHART --> WEB
+```
+
+所有组件运行在同一台阿里云 ECS 上，数据库仅监听 `127.0.0.1`，不暴露公网。
+
+---
+
+## 🧰 技术栈
+
+| 层 | 技术 |
+|---|---|
+| 前端 | Streamlit 1.65 |
+| 大模型 | 智谱 GLM-4-Flash（Function Calling / ReAct） |
+| 数据库 | PostgreSQL 14 + psycopg2 连接池 |
+| 文档解析 | pdfplumber、pandas、openpyxl |
+| 可视化 | Plotly |
+| 飞书 | lark-oapi（WebSocket 长连接，无需公网回调地址） |
+| 部署 | Ubuntu 22.04 + systemd + 阿里云 ECS |
+
+---
+
+## 📁 目录结构
+
+```
+.
+├── app.py                  # Streamlit 网页（本地开发版）
+├── bot_server.py           # 飞书机器人（本地 SQLite 版）
+├── mcp_server.py           # MCP 工具服务（SSE，端口 8000）
+├── feishu_reader.py        # 飞书文档读取（docx / wiki）
+├── start_all.bat           # Windows 一键启动（MCP + 网页 + 机器人）
+├── stop_all.bat            # Windows 一键停止
+└── server/                 # ★ 服务器部署包（阿里云实际运行版本）
+    ├── app.py              #   网页版（PostgreSQL）
+    ├── bot_server.py       #   飞书机器人（PostgreSQL）
+    ├── api_server.py       #   可选：只读数据 API（供外部调用）
+    ├── db.py               #   数据库访问层
+    ├── schema.sql          #   建表脚本
+    ├── requirements.txt    #   依赖（不含 PyTorch）
+    ├── finance-ai.service  #   systemd：网页
+    ├── finance-bot.service #   systemd：机器人
+    └── README.md           #   服务器部署详细说明
+```
+
+> `main` 分支保留早期 Streamlit Cloud 版本（已停用）；线上服务以 `server/` 为准。
+
+---
+
+## 🚀 服务器部署
+
+完整步骤见 [`server/README.md`](server/README.md)，概要：
+
+```bash
+# 1. 系统依赖
+apt update && apt install -y python3-pip python3-venv postgresql postgresql-contrib
+
+# 2. 建库
+sudo -u postgres psql -c "CREATE USER finance WITH PASSWORD '你的密码';"
+sudo -u postgres psql -c "CREATE DATABASE finance OWNER finance;"
+sudo -u postgres psql -d finance -c "GRANT ALL ON SCHEMA public TO finance;"
+
+# 3. 建表 + 装依赖
+PGPASSWORD='你的密码' psql -h 127.0.0.1 -U finance -d finance -f schema.sql
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# 4. 配置并启动
+cp .env.example .env && vi .env
+cp finance-ai.service finance-bot.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now finance-ai finance-bot
+```
+
+---
+
+## ⚙️ 环境变量
+
+| 变量 | 说明 |
+|---|---|
+| `ZHIPU_API_KEY` | 智谱开放平台 API Key |
+| `PGHOST` / `PGPORT` / `PGDATABASE` / `PGUSER` / `PGPASSWORD` | PostgreSQL 连接信息 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飞书自建应用凭证 |
+| `LOCAL_MCP` | 是否启用 MCP 工具服务（服务器默认 `false`） |
+| `API_KEY` | 可选数据 API 的访问密钥 |
+
+> ⚠️ `.env` 已在 `.gitignore` 中，**切勿提交**。
+
+---
+
+## 🔧 运维
+
+```bash
+systemctl status finance-ai finance-bot    # 状态
+systemctl restart finance-ai               # 改代码后重启
+journalctl -u finance-bot -f               # 飞书消息实时日志
+journalctl -u finance-ai -f                # 网页实时日志
+```
+
+查看数据库：
+
+```bash
+psql -h 127.0.0.1 -U finance -d finance
+```
+
+本地图形化访问（推荐，无需开放公网端口）：
+
+```bash
+ssh -L 15432:127.0.0.1:5432 -N root@<服务器IP>
+# 然后用 Navicat / DBeaver 连 127.0.0.1:15432
+```
+
+---
+
+## 🗃️ 数据库表
+
+| 表 | 字段 |
+|---|---|
+| `users` | `username`(PK) / `password` / `role` / `created_at` |
+| `invoices` | `id` / `发票号码`(UNIQUE) / `开票日期` / `购买方名称` / `销售方名称` / `价税合计` / `发票类型` / `文件名` |
+| `transactions` | `id` / `交易备注` / `金额` / `AI分类` / `created_at` |
+
+发票按**发票号码**唯一约束，重复上传同一张不会产生脏数据。
+
+---
+
+## 💬 飞书机器人接入
+
+1. [飞书开放平台](https://open.feishu.cn) 创建**企业自建应用**
+2. 添加「机器人」能力，开启权限：
+   - `im:message`、`im:message.p2p_msg:readonly`
+   - `im:message.group_at_msg:readonly`、`im:message:send_as_bot`
+3. 事件与回调 → 订阅方式选 **长连接**，添加事件 `im.message.receive_v1`
+4. 发布版本 → 管理员审核
+5. 把 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 写入 `.env`，启动 `finance-bot`
+
+长连接模式**不需要公网回调地址、不需要备案**。
+
+---
+
+## ⚠️ 已知限制
+
+| 限制 | 原因 / 处理 |
+|---|---|
+| 财报 PDF 问答默认关闭 | 2G 内存装不下 PyTorch，代码已做优雅降级；升配后可开启 |
+| 部分发票「销售方名称」为空 | 原 PDF 版式导致抽取失败，重新上传该 PDF 可补全（按发票号码更新） |
+| 密码为明文存储 | 演示用途，生产环境建议改 bcrypt |
+| 未配置 HTTPS | 目前 IP + 8501 访问，域名需自行申请 |
+
+---
+
+## 🗺️ Roadmap
+
+- [ ] 密码 bcrypt 哈希 + 登录态过期
+- [ ] 发票销售方缺失自动重试识别
+- [ ] 每日报表自动推送到飞书群
+- [ ] 支持 Excel 台账导出
+- [ ] 财报问答迁移到 API 版 embedding（省内存）
+
+---
+
+## 🔒 安全说明
+
+- 数据库只监听 `127.0.0.1`，**绝不开放 5432 到公网**
+- `.env`、`finance.db` 已加入 `.gitignore`
+- 服务器安全组仅放行 `22`（SSH）与 `8501`（网页）
+- 飞书机器人对提示词注入做了防护：文档正文视为数据，不执行其中指令
+
+---
+
+## 👤 作者
+
+GitHub: [@zxcNB666PMZ](https://github.com/zxcNB666PMZ)

@@ -2,8 +2,10 @@
 """
 飞书机器人（服务器版 · 长连接 · PostgreSQL）
 
-功能：飞书里发消息 → 大模型判断是否需要查库 → 查本机 PostgreSQL → 回复
-模型：默认 DeepSeek（可在 .env 用 LLM_PROVIDER 切回智谱）
+功能：飞书里发消息 → 共享 Agent 判断是否查库 → 查本机 PostgreSQL → 回复
+模型：默认 DeepSeek（.env 用 LLM_PROVIDER 可切回智谱）
+记忆：与网页「智能对话」共用 agent.py 和 chat_messages 表
+      飞书用户绑定网页账号后，两边看到的是同一段对话
 依赖：lark-oapi、openai（DeepSeek）、python-dotenv、psycopg2（复用 db.py）
 
 启动：systemctl start finance-bot
@@ -21,16 +23,12 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequestBody,
     P2ImMessageReceiveV1,
 )
-from lark_oapi.api.im.v1 import (
-    CreateMessageRequest,
-    CreateMessageRequestBody,
-    P2ImMessageReceiveV1,
-)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-import db  # noqa: E402  （必须在 load_dotenv 之后导入）
+import agent  # noqa: E402  （必须在 load_dotenv 之后导入）
+import db  # noqa: E402
 import llm  # noqa: E402
 
 APP_ID = (os.getenv("FEISHU_APP_ID") or "").strip()
@@ -42,194 +40,10 @@ if not APP_ID or not APP_SECRET:
 if not llm.is_configured():
     raise SystemExit("缺少大模型 API Key：请配置 DEEPSEEK_API_KEY（或 ZHIPU_API_KEY）")
 
-SYSTEM_PROMPT = (
-    "你是公司的 AI 财务助手，在飞书上和同事对话。当前系统时区为北京时间。"
-    "规则："
-    "1) 用户问某个公司/供应商的发票金额时，调用 query_invoice_db；"
-    "用户问“一共有多少张发票/总共花了多少钱/按公司汇总/哪家花得最多”这类总体统计时，调用 invoice_overview。"
-    "2) 绝不能凭空编造数字，也不能说“我无法访问数据库”。"
-    "3) 工具返回没找到时，可换更短的关键词（如把“北京滴滴出行科技有限公司”改成“滴滴”）再查一次；"
-    "仍然没有就如实告知，并提示库里现有公司名。"
-    "4) 回答口语化、适合手机阅读，金额保留两位小数，不要罗列无关字段。"
-    "5) 无法完成的事（如看具体发票图片、修改数据）要直说。"
-    "6) 不要把“发票”“总额”这类通用词当公司名去查——那是 invoice_overview 的活。"
-    "7) 【重要】凡是涉及“报销上限/预算/还能报多少/超没超”的问题，必须调用 reimbursement_check 工具，"
-    "把用户给的上限数字作为 limit_amount 传进去，绝对不要自己做减法或估算。"
-    "工具返回什么就照着说，不要改动算出来的数字。"
-)
-
 lark_client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "query_invoice_db",
-            "description": "按公司/供应商名称查询发票：统计张数与价税合计金额（购买方和销售方都会匹配）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "supplier_name": {
-                        "type": "string",
-                        "description": "公司或供应商名称关键词，如 滴滴、易行",
-                    }
-                },
-                "required": ["supplier_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "invoice_overview",
-            "description": "发票总览统计：库里一共有多少张发票、总金额多少、按销售方分组的金额与张数。适用于“总共多少”“哪家最多”“汇总一下”这类问题。",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "reimbursement_check",
-            "description": (
-                "报销额度核算：给出某公司的报销上限（元），返回已开票金额、还能报多少、是否超额。"
-                "凡涉及“上限/预算/还能报多少/超没超”的问题必须调用本工具，不要自己算。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "supplier_name": {
-                        "type": "string",
-                        "description": "公司或供应商名称关键词，如 滴滴",
-                    },
-                    "limit_amount": {
-                        "type": "number",
-                        "description": "报销上限金额（元），只填数字，如 5000",
-                    },
-                },
-                "required": ["supplier_name", "limit_amount"],
-            },
-        },
-    },
-]
-
-
-def reimbursement_check(supplier_name, limit_amount):
-    """报销额度核算：由代码算，不交给模型算"""
-    name = (supplier_name or "").strip()
-    if not name:
-        return "请提供要核算的公司或供应商名称。"
-
-    try:
-        limit = float(limit_amount)
-    except (TypeError, ValueError):
-        return f"报销上限“{limit_amount}”不是有效数字，请只给数字，例如 5000。"
-
-    try:
-        rows, samples = db.query_invoices(name)
-    except Exception as exc:
-        return f"查询数据库出错：{exc}"
-
-    if not rows:
-        hint = "、".join(samples) if samples else "（库是空的）"
-        return f"没有找到与“{name}”相关的发票，无法核算额度。库里现有的销售方有：{hint}。"
-
-    used = sum(float(r.get("价税合计") or 0) for r in rows)
-    remaining = round(limit - used, 2)
-
-    head = f"「{name}」相关发票共 {len(rows)} 张，已开票金额 {used:.2f} 元；报销上限 {limit:.2f} 元。"
-
-    if remaining > 0.005:
-        body = f"还能报 {remaining:.2f} 元（已用 {used / limit * 100:.1f}%）。"
-    elif abs(remaining) <= 0.005:
-        body = "额度刚好用完，还能报 0.00 元。"
-    else:
-        body = (
-            f"已经超额 {-remaining:.2f} 元，还能报 0.00 元。"
-            f"如需报销需额外审批（累计 {used:.2f} 元 > 上限 {limit:.2f} 元）。"
-        )
-
-    return head + body
-
-
-def invoice_overview():
-    """总览：总张数、总金额、按销售方分组"""
-    try:
-        rows = db.all_invoices()
-    except Exception as exc:
-        return f"查询数据库出错：{exc}"
-
-    if not rows:
-        return "数据库里目前还没有任何发票记录。"
-
-    total = 0.0
-    detail = {}
-    for row in rows:
-        amount = float(row.get("价税合计") or 0)
-        total += amount
-        key = row.get("销售方名称") or "（未识别销售方）"
-        item = detail.setdefault(key, {"n": 0, "amt": 0.0})
-        item["n"] += 1
-        item["amt"] += amount
-
-    lines = "\n".join(
-        f"  {k}：{v['n']} 张，{v['amt']:.2f} 元"
-        for k, v in sorted(detail.items(), key=lambda x: -x[1]["amt"])
-    )
-    return (
-        f"数据库共有 {len(rows)} 张发票，价税合计 {total:.2f} 元。\n"
-        f"按销售方分组：\n{lines}"
-    )
-
-
-def query_invoice_db(supplier_name):
-    name = (supplier_name or "").strip()
-    if not name:
-        return "请提供要查询的公司或供应商名称。"
-    try:
-        rows, samples = db.query_invoices(name)
-    except Exception as exc:
-        return f"查询数据库出错：{exc}"
-
-    if not rows:
-        hint = "、".join(samples) if samples else "（库是空的）"
-        return (
-            f"没有找到与“{name}”相关的发票。数据库里现有的销售方有：{hint}。"
-            "可以换个关键词，或向用户确认公司全称。"
-        )
-
-    total = 0.0
-    detail = {}
-    for row in rows:
-        amount = float(row.get("价税合计") or 0)
-        total += amount
-        key = row.get("销售方名称") or "（未识别）"
-        detail[key] = detail.get(key, 0.0) + amount
-
-    lines = "\n".join(
-        f"  {k}：{v:.2f} 元" for k, v in sorted(detail.items(), key=lambda x: -x[1])
-    )
-    return (
-        f"找到与“{name}”相关的发票共 {len(rows)} 张，价税合计 {total:.2f} 元。\n"
-        f"按销售方拆分：\n{lines}"
-    )
-
-
-_history = {}
-_history_lock = threading.Lock()
-MAX_MESSAGES = 12
 _seen_ids = set()
-
-
-def _remember(chat_id, role, content):
-    with _history_lock:
-        msgs = _history.setdefault(chat_id, [])
-        msgs.append({"role": role, "content": content})
-        del msgs[:-MAX_MESSAGES]
-
-
-def _history_of(chat_id):
-    with _history_lock:
-        return list(_history.get(chat_id, []))
+_seen_lock = threading.Lock()
 
 
 def _reply(chat_id, text):
@@ -261,60 +75,78 @@ def _extract_text(message):
     return text.strip()
 
 
-def _chat(chat_id, user_text):
-    _remember(chat_id, "user", user_text)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + _history_of(chat_id)
+def _sender_open_id(data):
+    """取发送者 open_id（不同版本 SDK 字段位置略有差异，逐个兜底）"""
+    try:
+        sender = getattr(data.event, "sender", None)
+        if sender is not None:
+            sender_id = getattr(sender, "sender_id", None)
+            if sender_id is not None:
+                for attr in ("open_id", "user_id", "union_id"):
+                    value = getattr(sender_id, attr, None)
+                    if value:
+                        return str(value)
+    except Exception:
+        pass
+    return None
 
-    for _ in range(3):
+
+def _conversation_key(chat_id, open_id):
+    """
+    决定这段对话存在哪个"会话"下：
+    - 飞书用户已绑定网页账号 → user:{用户名}，网页和飞书共享
+    - 没绑定 → feishu:{chat_id}，独立线程
+    """
+    if open_id:
         try:
-            reply = llm.chat(
-                messages, tools=TOOLS, tool_choice="auto", temperature=0.3
-            )
-        except llm.LLMError as exc:
-            return f"模型调用失败：{exc}"
-
-        if reply.tool_calls:
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": reply.content or "",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.name, "arguments": tc.arguments},
-                        }
-                        for tc in reply.tool_calls
-                    ],
-                }
-            )
-            for tool_call in reply.tool_calls:
-                name = tool_call.name
-                try:
-                    args = json.loads(tool_call.arguments or "{}")
-                except Exception:
-                    args = {}
-                if name == "query_invoice_db":
-                    result = query_invoice_db(args.get("supplier_name", ""))
-                elif name == "invoice_overview":
-                    result = invoice_overview()
-                elif name == "reimbursement_check":
-                    result = reimbursement_check(
-                        args.get("supplier_name", ""), args.get("limit_amount")
-                    )
-                else:
-                    result = f"未知工具：{name}"
-                print(f"[{time.strftime('%H:%M:%S')}] 工具 {name} -> {result[:80]}", flush=True)
-                messages.append(
-                    {"role": "tool", "tool_call_id": tool_call.id, "content": str(result)}
+            username = db.find_username_by_open_id(open_id)
+            if username:
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] 已绑定账号：{open_id[:12]}… → {username}",
+                    flush=True,
                 )
-            continue
+                return f"user:{username}"
+            print(f"[{time.strftime('%H:%M:%S')}] 未绑定的飞书用户：{open_id}", flush=True)
+        except Exception as exc:
+            print(f"查询绑定关系失败: {exc}", flush=True)
+    return f"feishu:{chat_id}"
 
-        answer = reply.content.strip() or "我没查到明确结果，换个说法再问一次？"
-        _remember(chat_id, "assistant", answer)
-        return answer
 
-    return "这个问题我查了几轮还没查清，换个更具体的公司名再问我一次？"
+def _chat(chat_id, user_text, open_id=None):
+    conversation_key = _conversation_key(chat_id, open_id)
+
+    outcome = agent.run(
+        conversation_key,
+        user_text,
+        channel="feishu",
+        on_tool=lambda name, args, result: print(
+            f"[{time.strftime('%H:%M:%S')}] 工具 {name} -> {str(result)[:80]}", flush=True
+        ),
+    )
+
+    if outcome["error"]:
+        print(f"模型错误：{outcome['error']}", flush=True)
+
+    return outcome["answer"]
+
+
+# 用户发这些词，机器人直接告知 open_id，方便绑定
+_ID_COMMANDS = {
+    "我的id", "我的ID", "我的 id", "我的open_id", "我的openid",
+    "我的open id", "绑定", "绑定账号", "获取id", "getid",
+}
+
+
+def _maybe_id_command(user_text, open_id, chat_id):
+    if not open_id:
+        return None
+    if (user_text or "").strip().lower() in {c.lower() for c in _ID_COMMANDS}:
+        return (
+            f"你的飞书 open_id 是：\n{open_id}\n\n"
+            "把这个发给管理员，让他到网页「👥 用户与权限 → 绑定飞书账号」里绑定你的网页账号。\n"
+            "绑定之后，你在网页和飞书里看到的就是同一段对话了。"
+        )
+    return None
 
 
 def on_message(data: P2ImMessageReceiveV1) -> None:
@@ -322,12 +154,14 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         message = data.event.message
         chat_id = message.chat_id
         msg_id = message.message_id
+        open_id = _sender_open_id(data)
 
-        if msg_id in _seen_ids:
-            return
-        _seen_ids.add(msg_id)
-        if len(_seen_ids) > 2000:
-            _seen_ids.clear()
+        with _seen_lock:
+            if msg_id in _seen_ids:
+                return
+            _seen_ids.add(msg_id)
+            if len(_seen_ids) > 2000:
+                _seen_ids.clear()
 
         if message.message_type != "text":
             _reply(chat_id, "我目前只看得懂文字消息哦")
@@ -337,9 +171,19 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         if not question:
             return
 
-        print(f"[{time.strftime('%H:%M:%S')}] 收到(chat_id={chat_id}): {question}", flush=True)
+        print(
+            f"[{time.strftime('%H:%M:%S')}] 收到(chat_id={chat_id}, open_id={open_id}): {question}",
+            flush=True,
+        )
+
+        # 发「我的ID」时直接回 open_id，不走大模型
+        special = _maybe_id_command(question, open_id, chat_id)
+        if special:
+            _reply(chat_id, special)
+            return
+
         try:
-            answer = _chat(chat_id, question)
+            answer = _chat(chat_id, question, open_id=open_id)
         except Exception as exc:
             print(f"处理失败: {exc}", flush=True)
             answer = "抱歉，我这边出了点问题，稍后再发一次？"
@@ -354,8 +198,9 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
 def main():
     try:
         print(f"发票库：{len(db.all_invoices())} 条记录", flush=True)
+        print(f"大模型：{llm.describe()}", flush=True)
     except Exception as exc:
-        print(f"读取发票库失败：{exc}", flush=True)
+        print(f"启动自检失败：{exc}", flush=True)
 
     handler = (
         lark.EventDispatcherHandler.builder("", "")

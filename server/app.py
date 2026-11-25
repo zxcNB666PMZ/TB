@@ -31,6 +31,9 @@ import ui
 import invoice_parser
 import permissions
 import llm
+import agent
+import bitable
+import push
 
 import db
 
@@ -282,54 +285,29 @@ def query_invoice_tool(supplier_name):
 
 
 # ==========================================
-# 注册工具给大模型
+# Agent 工具（与飞书机器人共用 agent.py；这里只补充网页独有的财报检索）
 # ==========================================
-agent_tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_financial_report",
-            "description": "当用户询问关于财报、年报、文档内容时，使用此工具检索财报文本。",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string", "description": "搜索关键词"}},
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_invoice_db",
-            "description": "当用户询问某个供应商、公司的发票总金额、台账记录时，使用此工具查询发票数据库。",
-            "parameters": {
-                "type": "object",
-                "properties": {"supplier_name": {"type": "string", "description": "供应商或公司名称，如滴滴"}},
-                "required": ["supplier_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculator",
-            "description": "当需要进行数学计算（如加减乘除、报销额度计算）时，使用此工具。",
-            "parameters": {
-                "type": "object",
-                "properties": {"expression": {"type": "string", "description": "数学表达式，如 1000-800"}},
-                "required": ["expression"]
-            }
-        }
-    }
-]
+AGENT_EXTRA_TOOLS = []
+AGENT_EXTRA_HANDLERS = {}
 
-SYSTEM_PROMPT = (
-    "你是公司的 AI 财务 Agent，连接着发票数据库（invoices 表）和财报知识库。规则："
-    "1) 用户问发票、金额、台账、报销时必须调用 query_invoice_db 工具，不要声称自己无法访问数据库；"
-    "2) 需要做加减乘除（例如算报销余额）时调用 calculator 工具；"
-    "3) 用户问财报、年报、文档内容时调用 search_financial_report 工具；"
-    "4) 工具返回“未找到”时，最多换一个说法再试一次，仍失败就如实告诉用户，绝对不要编造金额。"
-)
+if RAG_AVAILABLE:
+    AGENT_EXTRA_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_financial_report",
+                "description": "当用户询问财报、年报、文档内容时，用此工具检索已上传的财报 PDF 文本。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string", "description": "搜索关键词"}},
+                    "required": ["query"],
+                },
+            },
+        }
+    ]
+    AGENT_EXTRA_HANDLERS = {
+        "search_financial_report": lambda a: search_financial_report(a.get("query", ""))
+    }
 
 
 # ==========================================
@@ -341,7 +319,45 @@ if app_mode == "🤖 AI Agent 智能对话":
         "用自然语言查台账、算报销余额、做财务分析 —— 试试：「帮我查一下滴滴的发票总额，如果上限是 1000 元，还能报多少？」",
     )
 
+    # ---- 对话记忆：和飞书机器人共用同一个 conversation_key ----
+    conv_key = f"user:{st.session_state.current_user}"
+
+    try:
+        history = db.chat_history(conv_key, limit=60)
+    except Exception as e:
+        history = []
+        st.warning(f"读取对话记录失败：{e}")
+
     with st.sidebar:
+        st.markdown("---")
+        st.markdown("#### 💬 对话状态")
+        feishu_open_id = None
+        try:
+            with db.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT feishu_open_id FROM users WHERE username = %s",
+                        (st.session_state.current_user,),
+                    )
+                    row = cur.fetchone()
+                    feishu_open_id = row[0] if row else None
+        except Exception:
+            pass
+
+        if feishu_open_id:
+            st.success("✅ 已绑定飞书\n\n网页和飞书共用同一段对话")
+        else:
+            st.info(
+                "未绑定飞书。\n\n"
+                "绑定后，你在飞书里问的问题也会出现在这里，回答也会同步。\n"
+                "请管理员在「👥 用户与权限」页帮你绑定。"
+            )
+
+        if st.button("🧹 清空对话记录", use_container_width=True):
+            n = db.clear_chat(conv_key)
+            st.success(f"已清空 {n} 条记录")
+            st.rerun()
+
         st.markdown("---")
         st.header("📂 财报知识库")
         if not RAG_AVAILABLE:
@@ -360,88 +376,62 @@ if app_mode == "🤖 AI Agent 智能对话":
                     except Exception as e:
                         st.error(f"PDF解析失败: {e}")
 
-    if "agent_messages" not in st.session_state:
-        st.session_state.agent_messages = [{
-            "role": "assistant",
-            "content": "你好！我是你的 AI 财务总监。我不仅能看财报，还能直接去数据库查你的发票，并帮你算账。你想让我做点什么？"
-        }]
-
-    for msg in st.session_state.agent_messages:
-        if msg["role"] in ["user", "assistant"]:
-            with st.chat_message(msg["role"]):
+    # ---- 渲染历史对话 ----
+    if not history:
+        with st.chat_message("assistant"):
+            st.write(
+                "你好！我是你的 AI 财务助手。我可以查发票台账、算报销余额、做汇总分析。\n\n"
+                "试试问我：「库里一共有多少张发票？」或「我报销上限 5000，滴滴还能报多少？」"
+            )
+    else:
+        for msg in history:
+            role = msg["role"] if msg["role"] in ("user", "assistant") else "assistant"
+            with st.chat_message(role):
                 st.write(msg["content"])
+                if msg.get("channel") == "feishu":
+                    st.caption("📱 来自飞书")
 
+    # ---- 输入 ----
     if prompt := st.chat_input("例如：查一下滴滴的发票总额，看看超没超预算..."):
-        st.session_state.agent_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
 
         with st.chat_message("assistant"):
             with st.spinner("AI 正在思考并调度工具..."):
+                tool_box = st.container()
 
-                messages_to_send = [{"role": "system", "content": SYSTEM_PROMPT}] + st.session_state.agent_messages.copy()
-                final_answer = None
+                def _show_tool(name, args, result):
+                    with tool_box:
+                        st.caption(f"🛠️ 调用工具 `{name}`")
+                        st.caption(f"📦 结果：{str(result)[:200]}")
 
-                for step in range(5):
-                    try:
-                        reply = llm.chat(
-                            messages_to_send,
-                            tools=agent_tools,
-                            tool_choice="auto",
-                            temperature=0.3,
-                        )
+                outcome = agent.run(
+                    conv_key,
+                    prompt,
+                    channel="web",
+                    extra_tools=AGENT_EXTRA_TOOLS,
+                    extra_handlers=AGENT_EXTRA_HANDLERS,
+                    on_tool=_show_tool,
+                )
 
-                        if reply.tool_calls:
-                            messages_to_send.append({
-                                "role": "assistant",
-                                "content": reply.content or "",
-                                "tool_calls": [
-                                    {
-                                        "id": tc.id,
-                                        "type": "function",
-                                        "function": {"name": tc.name, "arguments": tc.arguments},
-                                    }
-                                    for tc in reply.tool_calls
-                                ],
-                            })
+                if outcome["error"]:
+                    st.error(f"⚠️ {outcome['error']}")
+                st.write(outcome["answer"])
 
-                            for tool_call in reply.tool_calls:
-                                tool_name = tool_call.name
-                                try:
-                                    tool_args = json.loads(tool_call.arguments or "{}")
-                                except Exception:
-                                    tool_args = {}
+                # 一键把这条回答推到飞书
+                c_push, c_copy = st.columns([1, 3])
+                with c_push:
+                    if st.button("📤 发送到飞书", use_container_width=True):
+                        ok, msg = push.send(outcome["answer"])
+                        (st.success if ok else st.error)(msg)
+                with c_copy:
+                    st.caption("点按钮会把这条回答直接推到你的飞书私聊（不需要先去飞书发消息）")
 
-                                st.caption(f"🛠️ Agent 正在调用工具: `{tool_name}` ...")
-
-                                if tool_name == "search_financial_report":
-                                    result = search_financial_report(tool_args.get("query", ""))
-                                elif tool_name == "query_invoice_db":
-                                    result = query_invoice_tool(tool_args.get("supplier_name", ""))
-                                elif tool_name == "calculator":
-                                    result = calculator(tool_args.get("expression", ""))
-                                else:
-                                    result = f"未知工具: {tool_name}"
-
-                                st.caption(f"📦 工具返回结果: {result}")
-
-                                messages_to_send.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": str(result)
-                                })
-                        else:
-                            final_answer = reply.content or "我没有得到有效结果。"
-                            break
-                    except Exception as e:
-                        st.error(f"Agent 思考出错: {e}")
-                        break
-
-                if final_answer is None:
-                    final_answer = "抱歉，我查了几轮仍然没有得出明确结论。可以换成公司全称再问我一次吗？"
-
-                st.write(final_answer)
-                st.session_state.agent_messages.append({"role": "assistant", "content": final_answer})
+                if outcome["tools"]:
+                    with st.expander(f"🔍 本次调用了 {len(outcome['tools'])} 个工具"):
+                        for t in outcome["tools"]:
+                            st.markdown(f"**{t['name']}** 参数 `{t['args']}`")
+                            st.code(str(t["result"]), language="text")
 
 
 # ==========================================
@@ -540,10 +530,27 @@ elif app_mode == "🧾 批量发票识别台账":
                 try:
                     n = db.upsert_invoices(valid_records)
                     st.success(f"💾 已写入 {n} 条发票记录（发票号码重复会自动更新）")
+
+                    # 有字段缺失时主动告警到飞书，避免悄无声息地脏数据入库
+                    if problem_records:
+                        detail = "\n".join(
+                            f"· {r.get('文件名') or r.get('发票号码')}：{'；'.join(r.get('_问题') or [])}"
+                            for r in problem_records[:8]
+                        )
+                        push.send_alert(
+                            f"发票入库有 {len(problem_records)} 张字段不完整",
+                            f"已入库 {n} 条，以下需核对原始 PDF：\n{detail}",
+                        )
+                        st.caption("📤 已把这次的问题清单推送到了你的飞书")
                 except Exception as e:
                     st.error(f"数据库保存失败: {e}")
+                    push.send_alert("发票入库失败", str(e)[:500])
             else:
                 st.error("❌ 这批文件都没能识别出发票号码，没有写入数据库。请检查 PDF 是否为电子发票原件。")
+                push.send_alert(
+                    "发票识别失败",
+                    f"上传了 {len(invoice_data_list)} 个文件，但都没识别出发票号码，未入库。",
+                )
 
             csv = show_df.to_csv(index=False).encode('utf-8-sig')
             st.download_button("📥 下载本次识别为 CSV", data=csv, file_name='本次发票台账.csv', mime='text/csv')
@@ -792,3 +799,153 @@ elif app_mode == "👥 用户与权限":
                     ok = db.delete_user(victim)
                     st.success(f"✅ 已删除「{victim}」" if ok else "未找到该用户")
                     st.rerun()
+
+    # ==========================================
+    # 飞书身份绑定
+    # ==========================================
+    st.markdown("---")
+    st.markdown("#### 🔗 飞书账号绑定")
+    st.caption(
+        "绑定后，这位同事在网页和飞书里看到的是同一段对话 —— "
+        "网页问过的问题飞书里能接着问，反之亦然。"
+    )
+
+    try:
+        bindings = db.list_feishu_bindings()
+        if bindings:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "网页账号": b["username"],
+                            "角色": permissions.normalize_role(b["role"]),
+                            "飞书 open_id": b["feishu_open_id"][:12] + "…",
+                        }
+                        for b in bindings
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("还没有任何账号绑定飞书。")
+    except Exception as e:
+        st.warning(f"读取绑定关系失败：{e}")
+
+    with st.expander("➕ 绑定 / 解绑飞书账号"):
+        st.markdown(
+            "**怎么拿到 open_id？**\n\n"
+            "1. 让同事在飞书里给机器人随便发一句话\n"
+            "2. 到服务器上执行下面这条命令，日志里会打印他的 open_id：\n"
+        )
+        st.code("journalctl -u finance-bot -n 50 | grep 收到", language="bash")
+        st.markdown("或者让同事直接问你，你把 open_id 填进来即可。")
+
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            bind_user = st.selectbox("网页账号", [u["username"] for u in users], key="bind_user")
+            bind_open_id = st.text_input("飞书 open_id（ou_ 开头）", key="bind_open_id")
+            if st.button("绑定", type="primary"):
+                if not bind_open_id.strip().startswith("ou_"):
+                    st.error("open_id 应该以 ou_ 开头，请检查")
+                else:
+                    ok, msg = db.bind_feishu(bind_user, bind_open_id.strip())
+                    (st.success if ok else st.error)(("✅ " if ok else "❌ ") + msg)
+                    if ok:
+                        st.rerun()
+        with col_b2:
+            bound_names = [b["username"] for b in bindings] if bindings else []
+            if bound_names:
+                unbind_user = st.selectbox("解绑账号", bound_names, key="unbind_user")
+                if st.button("解绑"):
+                    ok = db.unbind_feishu(unbind_user)
+                    st.success("✅ 已解绑" if ok else "未找到绑定关系")
+                    st.rerun()
+            else:
+                st.info("暂无可解绑的账号")
+
+    # ==========================================
+    # 飞书多维表格
+    # ==========================================
+    st.markdown("---")
+    st.markdown("#### 📊 飞书多维表格同步")
+    st.caption(f"当前配置：{bitable.describe()}")
+
+    if not bitable.is_configured():
+        st.warning(
+            "还没配置多维表格。请按下面两步做，然后告诉我 app_token 和 table_id，我帮你填进 .env：\n\n"
+            "**① 开放平台加权限**：飞书开放平台 → 你的应用 → 权限管理 → 搜索 `bitable` → "
+            "勾选「查看、评论、编辑和管理多维表格」→ 发布版本\n\n"
+            "**② 把机器人加进表格**：打开你的多维表格 → 右上角「···」→ 添加文档应用 → "
+            "选中你的机器人 → 权限选「可编辑」\n\n"
+            "然后从表格 URL 里找两个值：\n"
+            "- `https://xxx.feishu.cn/base/`**`bascnABCDxxxx`**`?table=`**`tblXXXX`**\n"
+            "- `base/` 后面那串是 app_token，`table=` 后面是 table_id"
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            in_app = st.text_input("app_token", key="bt_app")
+        with c2:
+            in_tbl = st.text_input("table_id", key="bt_tbl")
+        if st.button("保存配置到 .env"):
+            if not in_app.strip() or not in_tbl.strip():
+                st.error("两个值都要填")
+            else:
+                st.info(
+                    "请把这两个值发给我，我写进服务器的 .env 并重启服务。"
+                    "（或者你自己在 /opt/finance-ai/.env 里加 FEISHU_BITABLE_APP_TOKEN / FEISHU_BITABLE_TABLE_ID）"
+                )
+    else:
+        c1, c2, c3 = st.columns(3)
+        if c1.button("🔍 连通性自检"):
+            with st.spinner("检查中..."):
+                results = bitable.self_check()
+            for name, ok, detail in results:
+                (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {name}：{detail}")
+
+        if c2.button("⬆️ 推送发票到多维表格", type="primary"):
+            with st.spinner("正在同步..."):
+                try:
+                    created, skipped, errors = bitable.sync_all(only_missing=True)
+                    st.success(f"✅ 新增 {created} 条，跳过已存在 {skipped} 条")
+                    for e in errors:
+                        st.error(e)
+                    if errors:
+                        push.send_alert("多维表格同步失败", "\n".join(errors)[:500])
+                except Exception as e:
+                    st.error(f"同步失败：{e}")
+                    push.send_alert("多维表格同步失败", str(e)[:500])
+
+        if c3.button("📋 查看表格字段"):
+            try:
+                fields = bitable.list_fields()
+                st.dataframe(
+                    pd.DataFrame(
+                        [{"字段名": f.get("field_name"), "类型": f.get("type")} for f in fields]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            except Exception as e:
+                st.error(f"读取失败：{e}")
+
+        with st.expander("📥 从多维表格反向拉取（开发中）"):
+            st.info(
+                "功能已写好底层接口（bitable.list_records()），"
+                "但需要先确认表格字段名与数据库一致才能安全回写。"
+                "等你的表格建好后我再接。"
+            )
+
+    # ==========================================
+    # 系统集成状态
+    # ==========================================
+    st.markdown("---")
+    st.markdown("#### 🩺 系统状态")
+    try:
+        stats = db.chat_stats()
+        b1, b2, b3 = st.columns(3)
+        b1.metric("对话会话数", stats["conversations"])
+        b2.metric("对话消息数", stats["messages"])
+        b3.metric("大模型", llm.describe())
+    except Exception as e:
+        st.warning(f"读取统计失败：{e}")

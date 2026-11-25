@@ -46,3 +46,22 @@ CREATE TABLE IF NOT EXISTS transactions (
 --   GRANT ALL ON SCHEMA public TO finance;
 --   GRANT ALL ON ALL TABLES IN SCHEMA public TO finance;
 --   GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO finance;
+
+
+-- ==========================================
+-- 对话记忆（网页与飞书共用）
+-- ==========================================
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id BIGSERIAL PRIMARY KEY,
+    conversation_key TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    channel TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_chat_key_id ON chat_messages (conversation_key, id);
+
+-- 飞书身份绑定：绑定后网页和飞书共用同一段对话
+ALTER TABLE users ADD COLUMN IF NOT EXISTS feishu_open_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_feishu_open_id
+    ON users (feishu_open_id) WHERE feishu_open_id IS NOT NULL;

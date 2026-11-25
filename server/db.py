@@ -235,6 +235,156 @@ def admin_count():
 
 
 # ==========================================
+# 飞书身份绑定
+# ==========================================
+def find_user_by_feishu(open_id):
+    """按飞书 open_id 找到对应的网页账号"""
+    if not open_id:
+        return None
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT username, role FROM users WHERE feishu_open_id = %s", (open_id,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def bind_feishu(username, open_id):
+    """把飞书 open_id 绑到网页账号上；一个飞书号只能绑一个账号"""
+    if not username or not open_id:
+        return False, "用户名和 open_id 都不能为空"
+
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT username FROM users WHERE feishu_open_id = %s", (open_id,))
+        row = cur.fetchone()
+        if row and row["username"] != username:
+            return False, f"这个飞书号已经绑定到「{row['username']}」了，请先解绑"
+
+        cur.execute(
+            "UPDATE users SET feishu_open_id = %s WHERE username = %s",
+            (open_id, username),
+        )
+        if cur.rowcount == 0:
+            return False, f"用户「{username}」不存在"
+    return True, f"已把飞书号绑定到「{username}」"
+
+
+def unbind_feishu(username):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE users SET feishu_open_id = NULL WHERE username = %s", (username,)
+        )
+        return cur.rowcount > 0
+
+
+def list_feishu_bindings():
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT username, role, feishu_open_id FROM users "
+            "WHERE feishu_open_id IS NOT NULL ORDER BY username"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def find_username_by_open_id(open_id):
+    u = find_user_by_feishu(open_id)
+    return u["username"] if u else None
+
+
+# ==========================================
+# 对话记忆（网页和飞书共用）
+# ==========================================
+_chat_schema_ready = False
+
+
+def ensure_chat_schema():
+    """建对话表和飞书绑定字段（可重复执行）"""
+    global _chat_schema_ready
+    if _chat_schema_ready:
+        return
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id BIGSERIAL PRIMARY KEY,
+                conversation_key TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                channel TEXT,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_key_id "
+            "ON chat_messages (conversation_key, id)"
+        )
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feishu_open_id TEXT")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_feishu_open_id "
+            "ON users (feishu_open_id) WHERE feishu_open_id IS NOT NULL"
+        )
+    _chat_schema_ready = True
+
+
+def save_chat(conversation_key, role, content, channel=None):
+    ensure_chat_schema()
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO chat_messages (conversation_key, role, content, channel) "
+            "VALUES (%s, %s, %s, %s)",
+            (conversation_key, role, (content or "")[:8000], channel),
+        )
+
+
+def load_chat(conversation_key, limit=20):
+    """取最近 limit 轮消息，转成模型能吃的格式（user/assistant 交替）"""
+    ensure_chat_schema()
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT role, content FROM ("
+            "  SELECT id, role, content FROM chat_messages "
+            "  WHERE conversation_key = %s AND role IN ('user','assistant') "
+            "  ORDER BY id DESC LIMIT %s"
+            ") t ORDER BY id",
+            (conversation_key, limit),
+        )
+        return [{"role": r["role"], "content": r["content"]} for r in cur.fetchall()]
+
+
+def chat_history(conversation_key, limit=50):
+    """给界面展示用：带时间和渠道"""
+    ensure_chat_schema()
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT role, content, channel, created_at FROM ("
+            "  SELECT id, role, content, channel, created_at FROM chat_messages "
+            "  WHERE conversation_key = %s ORDER BY id DESC LIMIT %s"
+            ") t ORDER BY id",
+            (conversation_key, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def clear_chat(conversation_key):
+    ensure_chat_schema()
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM chat_messages WHERE conversation_key = %s", (conversation_key,))
+        return cur.rowcount
+
+
+def chat_stats():
+    """统计有多少个会话、多少条消息"""
+    ensure_chat_schema()
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT count(DISTINCT conversation_key) AS conversations, count(*) AS messages "
+            "FROM chat_messages"
+        )
+        return dict(cur.fetchone())
+
+
+# ==========================================
 # 发票
 # ==========================================
 def query_invoices(name):

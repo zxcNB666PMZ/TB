@@ -220,3 +220,7 @@ __marimo__/
 .streamlit/secrets.toml
 finance.db
 __pycache__/
+
+# 手工备份文件
+*.bak
+*.bak.*

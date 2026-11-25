@@ -26,9 +26,11 @@ import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from zhipuai import ZhipuAI
 
 import ui
+import invoice_parser
+import permissions
+import llm
 
 import db
 
@@ -78,14 +80,14 @@ def get_secret(key):
     return val
 
 
-api_key = get_secret("ZHIPU_API_KEY")
+api_key = get_secret("DEEPSEEK_API_KEY") or get_secret("ZHIPU_API_KEY")
 use_mcp = str(get_secret("USE_MCP") or get_secret("LOCAL_MCP") or "").lower() in ("1", "true", "yes")
 
-if not api_key:
-    st.error("🚨 未读取到 ZHIPU_API_KEY，请检查 .env 或云端 Secrets。")
+if not llm.is_configured():
+    st.error(
+        "🚨 未配置大模型 API Key。请在 .env 里填写 DEEPSEEK_API_KEY（推荐）或 ZHIPU_API_KEY。"
+    )
     st.stop()
-
-client = ZhipuAI(api_key=api_key)
 
 # 数据库连通性检查
 try:
@@ -120,7 +122,7 @@ if not st.session_state.logged_in:
                             print(f"[auth] {username} 的明文密码已自动升级为 bcrypt", flush=True)
                         st.session_state.logged_in = True
                         st.session_state.current_user = user.get("username")
-                        st.session_state.current_role = user.get("role") or "未知角色"
+                        st.session_state.current_role = permissions.normalize_role(user.get("role"))
                         st.rerun()
                     else:
                         st.error("❌ 用户名或密码错误！")
@@ -147,14 +149,30 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    app_mode = st.radio("功能模块", [
-        "🤖 AI Agent 智能对话",
-        "🧾 批量发票识别台账",
-        "🗄️ 历史数据查询",
-        "📈 流水智能分类",
-    ])
+    # ---- 权限：只显示当前角色能访问的页面 ----
+    _role = permissions.normalize_role(st.session_state.current_role)
+    _pages = permissions.allowed_pages(_role)
+
+    if not _pages:
+        st.error("该账号没有分配任何页面权限，请联系管理员。")
+        if st.button("🚪 退出登录", use_container_width=True):
+            st.session_state.logged_in = False
+            st.rerun()
+        st.stop()
+
+    app_mode = st.radio("功能模块", _pages)
+
+    # 双保险：即使 session_state 被改，也不允许越权进入
+    if not permissions.can_access(_role, app_mode):
+        st.error("⛔ 你没有权限访问该页面。")
+        st.stop()
 
     st.markdown("---")
+    st.markdown(
+        f'<div style="font-size:11px;opacity:.6;margin-bottom:6px">'
+        f'可访问 {len(_pages)} 个页面 · 模型 {llm.describe()}</div>',
+        unsafe_allow_html=True,
+    )
     if st.button("🚪 退出登录", use_container_width=True):
         st.session_state.logged_in = False
         st.rerun()
@@ -366,25 +384,31 @@ if app_mode == "🤖 AI Agent 智能对话":
 
                 for step in range(5):
                     try:
-                        response = client.chat.completions.create(
-                            model="glm-4-flash",
-                            messages=messages_to_send,
+                        reply = llm.chat(
+                            messages_to_send,
                             tools=agent_tools,
-                            tool_choice="auto"
+                            tool_choice="auto",
+                            temperature=0.3,
                         )
-                        response_message = response.choices[0].message
 
-                        if response_message.tool_calls:
+                        if reply.tool_calls:
                             messages_to_send.append({
                                 "role": "assistant",
-                                "content": response_message.content or "",
-                                "tool_calls": [tc.model_dump() for tc in response_message.tool_calls]
+                                "content": reply.content or "",
+                                "tool_calls": [
+                                    {
+                                        "id": tc.id,
+                                        "type": "function",
+                                        "function": {"name": tc.name, "arguments": tc.arguments},
+                                    }
+                                    for tc in reply.tool_calls
+                                ],
                             })
 
-                            for tool_call in response_message.tool_calls:
-                                tool_name = tool_call.function.name
+                            for tool_call in reply.tool_calls:
+                                tool_name = tool_call.name
                                 try:
-                                    tool_args = json.loads(tool_call.function.arguments or "{}")
+                                    tool_args = json.loads(tool_call.arguments or "{}")
                                 except Exception:
                                     tool_args = {}
 
@@ -407,7 +431,7 @@ if app_mode == "🤖 AI Agent 智能对话":
                                     "content": str(result)
                                 })
                         else:
-                            final_answer = response_message.content or "我没有得到有效结果。"
+                            final_answer = reply.content or "我没有得到有效结果。"
                             break
                     except Exception as e:
                         st.error(f"Agent 思考出错: {e}")
@@ -463,33 +487,65 @@ elif app_mode == "🧾 批量发票识别台账":
             """
 
             try:
-                response = client.chat.completions.create(
-                    model="glm-4-flash",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1,
-                )
-                raw_json = re.sub(r'```json\s*', '', response.choices[0].message.content)
-                raw_json = re.sub(r'```\s*', '', raw_json).strip()
-                data = json.loads(raw_json)
+                reply_text = llm.chat_text(prompt, temperature=0.1)
+                data = llm.parse_json_reply(reply_text, default={})
+                if not data:
+                    raise ValueError("模型没有返回可解析的 JSON，可能是发票文字不完整")
                 data["文件名"] = file.name
-                invoice_data_list.append(data)
+
+                # 规范化 + 校验（金额千分位、日期格式、缺字段都会在这里处理）
+                record = invoice_parser.clean_invoice_record(data)
+                problems = invoice_parser.validate_invoice_record(record)
+                record["_问题"] = problems
+                invoice_data_list.append(record)
             except Exception as e:
                 st.error(f"处理 {file.name} 时出错: {e}")
 
             progress_bar.progress((i + 1) / len(uploaded_invoices))
 
         if invoice_data_list:
-            st.success(f"🎉 成功识别 {len(invoice_data_list)} 张发票！")
-            df = pd.DataFrame(invoice_data_list)
-            st.dataframe(df, use_container_width=True)
+            valid_records = [r for r in invoice_data_list if r.get("发票号码")]
+            problem_records = [r for r in invoice_data_list if r.get("_问题")]
 
-            try:
-                n = db.upsert_invoices(invoice_data_list)
-                st.success(f"💾 已写入 {n} 条发票记录到 PostgreSQL（发票号码重复会自动更新）")
-            except Exception as e:
-                st.error(f"数据库保存失败: {e}")
+            st.success(f"🎉 识别完成 {len(invoice_data_list)} 张，其中 {len(valid_records)} 张有发票号码可以入库")
 
-            csv = df.to_csv(index=False).encode('utf-8-sig')
+            show_df = pd.DataFrame(
+                [{k: v for k, v in r.items() if k != "_问题"} for r in invoice_data_list]
+            )
+            st.dataframe(show_df, use_container_width=True)
+
+            # 字段缺失/异常提醒
+            if problem_records:
+                st.warning(
+                    f"⚠️ 有 {len(problem_records)} 张发票字段不完整或数值异常，"
+                    "入库后统计可能不准，建议核对原始 PDF："
+                )
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "文件名": r.get("文件名"),
+                                "发票号码": r.get("发票号码"),
+                                "销售方": r.get("销售方名称") or "(缺)",
+                                "金额": r.get("价税合计"),
+                                "问题": "；".join(r.get("_问题") or []),
+                            }
+                            for r in problem_records
+                        ]
+                    ),
+                    use_container_width=True,
+                )
+
+            if valid_records:
+                try:
+                    n = db.upsert_invoices(valid_records)
+                    st.success(f"💾 已写入 {n} 条发票记录（发票号码重复会自动更新）")
+                except Exception as e:
+                    st.error(f"数据库保存失败: {e}")
+            else:
+                st.error("❌ 这批文件都没能识别出发票号码，没有写入数据库。请检查 PDF 是否为电子发票原件。")
+
+            csv = show_df.to_csv(index=False).encode('utf-8-sig')
             st.download_button("📥 下载本次识别为 CSV", data=csv, file_name='本次发票台账.csv', mime='text/csv')
 
 
@@ -511,6 +567,21 @@ elif app_mode == "🗄️ 历史数据查询":
             col1.metric("💰 发票总金额", f"¥ {total_amount:,.2f}")
             col2.metric("🧾 发票张数", f"{len(df_history)} 张")
             col3.metric("📅 覆盖天数", f"{df_history['开票日期'].nunique()} 天" if "开票日期" in df_history.columns else "—")
+
+            # 数据质量提醒
+            try:
+                q = db.quality_summary()
+                if q["total"] and q["no_seller"]:
+                    ratio = float(q["no_seller_amount"]) / float(q["total_amount"] or 1) * 100
+                    st.warning(
+                        f"⚠️ 数据质量：{q['no_seller']} 张发票缺少「销售方名称」，"
+                        f"涉及金额 ¥{float(q['no_seller_amount']):,.2f}（占 {ratio:.0f}%）。"
+                        "这部分金额无法按供应商统计，建议重新上传原始 PDF 覆盖更新。"
+                    )
+                if q["bad_amount"]:
+                    st.warning(f"⚠️ 有 {q['bad_amount']} 张发票金额缺失或异常，请核对。")
+            except Exception:
+                pass
 
             st.markdown("---")
 
@@ -558,15 +629,12 @@ elif app_mode == "📈 流水智能分类":
                     unique_remarks = df_bank[remark_col].astype(str).unique().tolist()[:50]
                     prompt = f"请将以下备注分类到：['餐饮', '交通', '办公', '工资', '采购', '娱乐', '其他']。严格返回 JSON 字典。\n备注：{unique_remarks}"
 
-                    response = client.chat.completions.create(
-                        model="glm-4-flash",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.1,
-                    )
-                    raw_json = re.sub(r'```json\s*', '', response.choices[0].message.content)
-                    raw_json = re.sub(r'```\s*', '', raw_json).strip()
+                    reply_text = llm.chat_text(prompt, temperature=0.1)
+                    category_map = llm.parse_json_reply(reply_text, default={})
+                    if not category_map:
+                        st.error("AI 没有返回有效的分类结果，本次未写入数据库。请检查 API Key 或稍后重试。")
+                        st.stop()
 
-                    category_map = json.loads(raw_json)
                     df_bank['AI分类'] = df_bank[remark_col].astype(str).map(category_map).fillna('其他')
 
                     st.dataframe(df_bank[[remark_col, amount_col, 'AI分类']].head(10), use_container_width=True)
@@ -581,3 +649,146 @@ elif app_mode == "📈 流水智能分类":
                     st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
             st.error(f"读取失败: {e}")
+
+
+# ==========================================
+# 模块五：用户与权限（仅管理员）
+# ==========================================
+elif app_mode == "👥 用户与权限":
+    if not permissions.can_manage_users(st.session_state.current_role):
+        st.error("⛔ 只有管理员可以管理用户。")
+        st.stop()
+
+    ui.hero("用户与权限", "给不同的人分配不同角色，各自只看到自己能用的页面。")
+
+    # ---- 角色权限说明 ----
+    st.markdown("#### 🎫 角色能看到的页面")
+    role_rows = []
+    for role, pages in permissions.role_summary():
+        role_rows.append({"角色": role, "可访问页面": " 、 ".join(pages) if pages else "（无）"})
+    st.dataframe(pd.DataFrame(role_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ---- 现有用户 ----
+    st.markdown("#### 👤 现有账号")
+    try:
+        users = db.list_users()
+        role_counts = {}
+        for u in users:
+            r = permissions.normalize_role(u.get("role"))
+            role_counts[r] = role_counts.get(r, 0) + 1
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("账号总数", len(users))
+        m2.metric("管理员", role_counts.get("管理员", 0))
+        m3.metric("财务专员", role_counts.get("财务专员", 0))
+        m4.metric("查看者", role_counts.get("查看者", 0))
+
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "用户名": u["username"],
+                        "角色": permissions.normalize_role(u.get("role")),
+                        "可访问页面数": len(permissions.allowed_pages(u.get("role"))),
+                    }
+                    for u in users
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    except Exception as e:
+        st.error(f"读取用户列表失败: {e}")
+        users = []
+
+    st.markdown("---")
+
+    tab_add, tab_edit, tab_pwd = st.tabs(["➕ 新建账号", "🔧 改角色", "🔑 重置密码"])
+
+    # 新建账号
+    with tab_add:
+        with st.form("form_add_user", clear_on_submit=True):
+            new_user = st.text_input("用户名", placeholder="例如 zhangsan")
+            new_pwd = st.text_input("初始密码", type="password", placeholder="至少 6 位")
+            new_pwd2 = st.text_input("确认密码", type="password")
+            new_role = st.selectbox("角色", permissions.ALL_ROLES, index=2)
+            submitted = st.form_submit_button("创建账号", type="primary")
+
+        if submitted:
+            if new_pwd != new_pwd2:
+                st.error("两次输入的密码不一致")
+            else:
+                ok, msg = db.create_user(new_user, new_pwd, new_role)
+                (st.success if ok else st.error)(("✅ " if ok else "❌ ") + msg)
+                if ok:
+                    st.rerun()
+
+    # 改角色
+    with tab_edit:
+        user_names = [u["username"] for u in users]
+        if not user_names:
+            st.info("还没有账号")
+        else:
+            target = st.selectbox("选择账号", user_names, key="edit_target")
+            current = next(
+                (permissions.normalize_role(u.get("role")) for u in users if u["username"] == target),
+                "",
+            )
+            st.caption(f"当前角色：{current}")
+            new_role2 = st.selectbox(
+                "改成", permissions.ALL_ROLES, index=permissions.ALL_ROLES.index(current) if current in permissions.ALL_ROLES else 2
+            )
+            if st.button("保存角色", type="primary"):
+                # 防止把最后一个管理员降级，导致没人能管
+                if current == "管理员" and new_role2 != "管理员" and db.admin_count() <= 1:
+                    st.error("❌ 这是最后一个管理员，不能改成其他角色（否则没人能管理系统了）")
+                elif target == st.session_state.current_user and new_role2 != "管理员":
+                    st.warning("⚠️ 你改的是自己的角色，保存后会立即失去管理权限。")
+                    db.update_user_role(target, new_role2)
+                    st.session_state.current_role = new_role2
+                    st.rerun()
+                else:
+                    db.update_user_role(target, new_role2)
+                    st.success(f"✅ 已把「{target}」改为 {new_role2}")
+                    st.rerun()
+
+    # 重置密码
+    with tab_pwd:
+        user_names2 = [u["username"] for u in users]
+        if not user_names2:
+            st.info("还没有账号")
+        else:
+            target2 = st.selectbox("选择账号", user_names2, key="pwd_target")
+            p1 = st.text_input("新密码", type="password", key="p1")
+            p2 = st.text_input("确认新密码", type="password", key="p2")
+            if st.button("重置密码", type="primary"):
+                if not p1 or len(p1) < 6:
+                    st.error("密码至少 6 位")
+                elif p1 != p2:
+                    st.error("两次输入的密码不一致")
+                else:
+                    db.set_password(target2, p1)
+                    st.success(f"✅ 已重置「{target2}」的密码")
+
+    st.markdown("---")
+    with st.expander("🗑️ 删除账号（谨慎操作）"):
+        names = [u["username"] for u in users if u["username"] != st.session_state.current_user]
+        if not names:
+            st.info("没有可删除的其他账号")
+        else:
+            victim = st.selectbox("选择要删除的账号", names, key="del_target")
+            confirm = st.text_input("输入 DELETE 确认删除", key="del_confirm")
+            if st.button("删除账号"):
+                if confirm.strip().upper() != "DELETE":
+                    st.error("请先输入 DELETE 确认")
+                elif db.admin_count() <= 1 and any(
+                    u["username"] == victim and permissions.normalize_role(u.get("role")) == "管理员"
+                    for u in users
+                ):
+                    st.error("❌ 不能删除最后一个管理员")
+                else:
+                    ok = db.delete_user(victim)
+                    st.success(f"✅ 已删除「{victim}」" if ok else "未找到该用户")
+                    st.rerun()

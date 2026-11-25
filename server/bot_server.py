@@ -2,8 +2,9 @@
 """
 飞书机器人（服务器版 · 长连接 · PostgreSQL）
 
-功能：飞书里发消息 → 智谱 GLM 判断是否需要查库 → 查本机 PostgreSQL → 回复
-依赖：lark-oapi、zhipuai、python-dotenv、psycopg2（复用 db.py）
+功能：飞书里发消息 → 大模型判断是否需要查库 → 查本机 PostgreSQL → 回复
+模型：默认 DeepSeek（可在 .env 用 LLM_PROVIDER 切回智谱）
+依赖：lark-oapi、openai（DeepSeek）、python-dotenv、psycopg2（复用 db.py）
 
 启动：systemctl start finance-bot
 """
@@ -20,22 +21,26 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequestBody,
     P2ImMessageReceiveV1,
 )
-from zhipuai import ZhipuAI
+from lark_oapi.api.im.v1 import (
+    CreateMessageRequest,
+    CreateMessageRequestBody,
+    P2ImMessageReceiveV1,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 import db  # noqa: E402  （必须在 load_dotenv 之后导入）
+import llm  # noqa: E402
 
 APP_ID = (os.getenv("FEISHU_APP_ID") or "").strip()
 APP_SECRET = (os.getenv("FEISHU_APP_SECRET") or "").strip()
-ZHIPU_API_KEY = (os.getenv("ZHIPU_API_KEY") or "").strip()
-MODEL = os.getenv("ZHIPU_MODEL", "glm-4-flash")
+MODEL = llm.model_name()
 
 if not APP_ID or not APP_SECRET:
     raise SystemExit("缺少 FEISHU_APP_ID / FEISHU_APP_SECRET")
-if not ZHIPU_API_KEY:
-    raise SystemExit("缺少 ZHIPU_API_KEY")
+if not llm.is_configured():
+    raise SystemExit("缺少大模型 API Key：请配置 DEEPSEEK_API_KEY（或 ZHIPU_API_KEY）")
 
 SYSTEM_PROMPT = (
     "你是公司的 AI 财务助手，在飞书上和同事对话。当前系统时区为北京时间。"
@@ -48,10 +53,12 @@ SYSTEM_PROMPT = (
     "4) 回答口语化、适合手机阅读，金额保留两位小数，不要罗列无关字段。"
     "5) 无法完成的事（如看具体发票图片、修改数据）要直说。"
     "6) 不要把“发票”“总额”这类通用词当公司名去查——那是 invoice_overview 的活。"
+    "7) 【重要】凡是涉及“报销上限/预算/还能报多少/超没超”的问题，必须调用 reimbursement_check 工具，"
+    "把用户给的上限数字作为 limit_amount 传进去，绝对不要自己做减法或估算。"
+    "工具返回什么就照着说，不要改动算出来的数字。"
 )
 
 lark_client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
-zhipu = ZhipuAI(api_key=ZHIPU_API_KEY)
 
 TOOLS = [
     {
@@ -79,7 +86,69 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "reimbursement_check",
+            "description": (
+                "报销额度核算：给出某公司的报销上限（元），返回已开票金额、还能报多少、是否超额。"
+                "凡涉及“上限/预算/还能报多少/超没超”的问题必须调用本工具，不要自己算。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "supplier_name": {
+                        "type": "string",
+                        "description": "公司或供应商名称关键词，如 滴滴",
+                    },
+                    "limit_amount": {
+                        "type": "number",
+                        "description": "报销上限金额（元），只填数字，如 5000",
+                    },
+                },
+                "required": ["supplier_name", "limit_amount"],
+            },
+        },
+    },
 ]
+
+
+def reimbursement_check(supplier_name, limit_amount):
+    """报销额度核算：由代码算，不交给模型算"""
+    name = (supplier_name or "").strip()
+    if not name:
+        return "请提供要核算的公司或供应商名称。"
+
+    try:
+        limit = float(limit_amount)
+    except (TypeError, ValueError):
+        return f"报销上限“{limit_amount}”不是有效数字，请只给数字，例如 5000。"
+
+    try:
+        rows, samples = db.query_invoices(name)
+    except Exception as exc:
+        return f"查询数据库出错：{exc}"
+
+    if not rows:
+        hint = "、".join(samples) if samples else "（库是空的）"
+        return f"没有找到与“{name}”相关的发票，无法核算额度。库里现有的销售方有：{hint}。"
+
+    used = sum(float(r.get("价税合计") or 0) for r in rows)
+    remaining = round(limit - used, 2)
+
+    head = f"「{name}」相关发票共 {len(rows)} 张，已开票金额 {used:.2f} 元；报销上限 {limit:.2f} 元。"
+
+    if remaining > 0.005:
+        body = f"还能报 {remaining:.2f} 元（已用 {used / limit * 100:.1f}%）。"
+    elif abs(remaining) <= 0.005:
+        body = "额度刚好用完，还能报 0.00 元。"
+    else:
+        body = (
+            f"已经超额 {-remaining:.2f} 元，还能报 0.00 元。"
+            f"如需报销需额外审批（累计 {used:.2f} 元 > 上限 {limit:.2f} 元）。"
+        )
+
+    return head + body
 
 
 def invoice_overview():
@@ -197,33 +266,42 @@ def _chat(chat_id, user_text):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + _history_of(chat_id)
 
     for _ in range(3):
-        resp = zhipu.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.3,
-        )
-        msg = resp.choices[0].message
+        try:
+            reply = llm.chat(
+                messages, tools=TOOLS, tool_choice="auto", temperature=0.3
+            )
+        except llm.LLMError as exc:
+            return f"模型调用失败：{exc}"
 
-        if getattr(msg, "tool_calls", None):
+        if reply.tool_calls:
             messages.append(
                 {
                     "role": "assistant",
-                    "content": msg.content or "",
-                    "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
+                    "content": reply.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.name, "arguments": tc.arguments},
+                        }
+                        for tc in reply.tool_calls
+                    ],
                 }
             )
-            for tool_call in msg.tool_calls:
-                name = tool_call.function.name
+            for tool_call in reply.tool_calls:
+                name = tool_call.name
                 try:
-                    args = json.loads(tool_call.function.arguments or "{}")
+                    args = json.loads(tool_call.arguments or "{}")
                 except Exception:
                     args = {}
                 if name == "query_invoice_db":
                     result = query_invoice_db(args.get("supplier_name", ""))
                 elif name == "invoice_overview":
                     result = invoice_overview()
+                elif name == "reimbursement_check":
+                    result = reimbursement_check(
+                        args.get("supplier_name", ""), args.get("limit_amount")
+                    )
                 else:
                     result = f"未知工具：{name}"
                 print(f"[{time.strftime('%H:%M:%S')}] 工具 {name} -> {result[:80]}", flush=True)
@@ -232,7 +310,7 @@ def _chat(chat_id, user_text):
                 )
             continue
 
-        answer = (msg.content or "").strip() or "我没查到明确结果，换个说法再问一次？"
+        answer = reply.content.strip() or "我没查到明确结果，换个说法再问一次？"
         _remember(chat_id, "assistant", answer)
         return answer
 

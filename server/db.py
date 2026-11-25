@@ -5,12 +5,17 @@
 """
 
 import os
+import re
 from contextlib import contextmanager
+from datetime import date as _date_cls
+from datetime import datetime
 
 import bcrypt
 import psycopg2
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor, execute_values
+
+import invoice_parser
 
 # 自己加载 .env：这样任何脚本 import db 都能直接连库，不必依赖调用方先 load_dotenv
 try:
@@ -57,21 +62,67 @@ def get_conn():
 
 
 def _num(value):
-    """转成数字，失败返回 None"""
+    """转成数字，失败返回 None（兼容 "1,234.56" / "¥88.8" / "88.8元"）"""
     if value is None or value == "":
         return None
-    try:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
         return float(value)
-    except (TypeError, ValueError):
+
+    text = str(value).strip()
+    if not text:
+        return None
+    text = (
+        text.replace(",", "")
+        .replace("，", "")
+        .replace("¥", "")
+        .replace("￥", "")
+        .replace("元", "")
+        .replace(" ", "")
+        .replace("\u00a0", "")
+    )
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group())
+    except ValueError:
         return None
 
 
 def _date(value):
-    """只保留 YYYY-MM-DD，失败返回 None"""
+    """统一成 YYYY-MM-DD，失败返回 None（兼容 2026/11/01、2026年11月01日）"""
     if not value:
         return None
-    text = str(value).strip()[:10]
-    return text or None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+
+    if isinstance(value, _date_cls):
+        return value.isoformat()
+
+    # 2026/11/01、2026.11.01、2026年11月01日 → 2026-11-01
+    normalized = (
+        text.replace("/", "-")
+        .replace(".", "-")
+        .replace("年", "-")
+        .replace("月", "-")
+        .replace("日", "")
+        .strip()
+    )
+    match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", normalized)
+    if not match:
+        return None
+    year, month, day = match.groups()
+    try:
+        return _date_cls(int(year), int(month), int(day)).isoformat()
+    except ValueError:
+        return None
 
 
 def _like_escape(text):
@@ -132,15 +183,70 @@ def verify_login(username, password):
     return None, False
 
 
+def list_users():
+    """列出所有用户（不含密码）"""
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT username, role FROM users ORDER BY username")
+        return [dict(r) for r in cur.fetchall()]
+
+
+def create_user(username, password, role):
+    """
+    新建用户。返回 (是否成功, 提示信息)
+    用户名已存在时不覆盖，避免误改别人的密码。
+    """
+    username = (username or "").strip()
+    if not username:
+        return False, "用户名不能为空"
+    if not password or len(password) < 6:
+        return False, "密码至少 6 位"
+    if find_user(username):
+        return False, f"用户「{username}」已存在"
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO users (username, password, role) VALUES (%s, %s, %s)",
+            (username, hash_password(password), role),
+        )
+    return True, f"已创建用户「{username}」，角色：{role}"
+
+
+def update_user_role(username, role):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE users SET role = %s WHERE username = %s", (role, username))
+        return cur.rowcount
+
+
+def delete_user(username):
+    """删除用户，返回是否删掉了"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM users WHERE username = %s", (username,))
+        return cur.rowcount > 0
+
+
+def count_by_role(role):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM users WHERE role = %s", (role,))
+        return cur.fetchone()[0]
+
+
+def admin_count():
+    return count_by_role("管理员")
+
+
 # ==========================================
 # 发票
 # ==========================================
 def query_invoices(name):
     """
-    按供应商名模糊查询（购买方 + 销售方都查）。
+    按供应商名模糊查询（购买方 + 销售方都查），并做**供应商别名归一化匹配**：
+    搜"滴滴"也能命中"北京滴滴出行科技有限公司"、"滴滴出行科技有限公司"等不同写法。
+
     返回 (匹配行列表, 库内现有销售方名称样例)
     """
-    pattern = "%" + _like_escape(name) + "%"
+    keyword = (name or "").strip()
+    pattern = "%" + _like_escape(keyword) + "%"
+
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             'SELECT "价税合计", "购买方名称", "销售方名称" FROM invoices '
@@ -148,6 +254,30 @@ def query_invoices(name):
             (pattern, pattern),
         )
         rows = [dict(r) for r in cur.fetchall()]
+
+        # 归一化别名匹配：把库里所有销售方名称取出来，找出与关键词"同一家公司"的
+        if keyword:
+            cur.execute(
+                'SELECT DISTINCT "销售方名称" AS s FROM invoices '
+                'WHERE "销售方名称" IS NOT NULL AND trim("销售方名称") <> \'\''
+            )
+            existing_names = [r["s"] for r in cur.fetchall()]
+            aliases = [n for n in existing_names if invoice_parser.same_supplier(keyword, n)]
+
+            found = {(r.get("销售方名称"), r.get("购买方名称"), str(r.get("价税合计"))) for r in rows}
+            extra = [n for n in aliases if not any(r.get("销售方名称") == n for r in rows)]
+            if extra:
+                cur.execute(
+                    'SELECT "价税合计", "购买方名称", "销售方名称" FROM invoices '
+                    'WHERE "销售方名称" = ANY(%s)',
+                    (extra,),
+                )
+                for r in cur.fetchall():
+                    item = dict(r)
+                    key = (item.get("销售方名称"), item.get("购买方名称"), str(item.get("价税合计")))
+                    if key not in found:
+                        found.add(key)
+                        rows.append(item)
 
         samples = []
         if not rows:
@@ -160,6 +290,29 @@ def query_invoices(name):
         return rows, samples
 
 
+def quality_summary():
+    """数据质量概览：总数、缺销售方名称的条数与金额"""
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+              count(*) AS total,
+              count(*) FILTER (
+                WHERE "销售方名称" IS NULL OR trim("销售方名称") = ''
+              ) AS no_seller,
+              coalesce(sum("价税合计") FILTER (
+                WHERE "销售方名称" IS NULL OR trim("销售方名称") = ''
+              ), 0) AS no_seller_amount,
+              coalesce(sum("价税合计"), 0) AS total_amount,
+              count(*) FILTER (
+                WHERE "价税合计" IS NULL OR "价税合计" <= 0
+              ) AS bad_amount
+            FROM invoices
+            """
+        )
+        return dict(cur.fetchone())
+
+
 def all_invoices():
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute('SELECT * FROM invoices ORDER BY "开票日期" DESC NULLS LAST, id DESC')
@@ -170,15 +323,23 @@ INVOICE_COLS = ["发票号码", "开票日期", "购买方名称", "销售方名
 
 
 def upsert_invoices(records):
-    """批量写入发票，按发票号码去重（有则更新，无则插入）"""
+    """
+    批量写入发票，按发票号码去重（有则更新，无则插入）。
+    没有发票号码的记录会被跳过（无法去重，写进去只会产生垃圾数据）。
+    返回实际写入条数。
+    """
     if not records:
         return 0
 
-    # 同一批次里发票号码可能重复，先合并，避免 ON CONFLICT 报错
+    # 同一批次里发票号码可能重复，先合并，避免 ON CONFLICT 报错；顺便丢掉无号码的
     seen = {}
-    for idx, r in enumerate(records):
-        key = (r.get("发票号码") or "").strip() or f"__no_num_{idx}"
+    for r in records:
+        key = str(r.get("发票号码") or "").strip()
+        if not key:
+            continue
         seen[key] = r
+    if not seen:
+        return 0
     records = list(seen.values())
 
     values = []

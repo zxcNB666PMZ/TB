@@ -1,0 +1,10 @@
+[Unit]
+Description=Finance system healthcheck
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/finance-ai
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-/opt/finance-ai/.env
+ExecStart=/opt/finance-ai/.venv/bin/python /opt/finance-ai/healthcheck.py

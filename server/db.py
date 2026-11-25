@@ -7,9 +7,18 @@
 import os
 from contextlib import contextmanager
 
+import bcrypt
 import psycopg2
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor, execute_values
+
+# 自己加载 .env：这样任何脚本 import db 都能直接连库，不必依赖调用方先 load_dotenv
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except Exception:
+    pass
 
 _pool = None
 
@@ -81,6 +90,46 @@ def find_user(username):
         )
         row = cur.fetchone()
         return dict(row) if row else None
+
+
+def hash_password(password):
+    """bcrypt 加盐哈希"""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _is_hash(value):
+    return bool(value) and value.startswith(("$2a$", "$2b$", "$2y$"))
+
+
+def set_password(username, password):
+    """把用户密码改成 bcrypt 哈希存储"""
+    hashed = hash_password(password)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE users SET password = %s WHERE username = %s", (hashed, username))
+
+
+def verify_login(username, password):
+    """
+    校验登录。返回 (user 或 None, 是否刚升级为哈希)
+    兼容历史明文密码：校验通过后自动改写为 bcrypt 哈希。
+    """
+    user = find_user(username)
+    if not user:
+        return None, False
+
+    stored = user.get("password") or ""
+    if _is_hash(stored):
+        try:
+            ok = bcrypt.checkpw(password.encode("utf-8"), stored.encode("utf-8"))
+        except ValueError:
+            ok = False
+        return (user if ok else None), False
+
+    # 旧明文密码
+    if stored == password:
+        set_password(username, password)
+        return user, True
+    return None, False
 
 
 # ==========================================

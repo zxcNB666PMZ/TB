@@ -28,6 +28,8 @@ from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from zhipuai import ZhipuAI
 
+import ui
+
 import db
 
 # ---- MCP 是可选依赖：没装/没启动都不影响主流程 ----
@@ -60,7 +62,7 @@ except Exception:
 load_dotenv()
 
 st.set_page_config(page_title="财务 AI 助手", page_icon="💼", layout="wide")
-st.title("💼 财务 AI 智能分析与台账助手")
+ui.inject_css()
 
 
 # ==========================================
@@ -103,27 +105,27 @@ if "logged_in" not in st.session_state:
     st.session_state.current_role = ""
 
 if not st.session_state.logged_in:
-    st.markdown("### 🔐 请先登录财务 AI 系统")
-    st.info("为了保护财务数据安全，请验证您的身份。")
+    _left, _mid, _right = st.columns([1, 1.15, 1])
+    with _mid:
+        with st.container(border=True):
+            ui.login_card_head()
+            username = st.text_input("用户名", placeholder="请输入用户名")
+            password = st.text_input("密码", type="password", placeholder="请输入密码")
 
-    username = st.text_input("用户名")
-    password = st.text_input("密码", type="password")
-
-    if st.button("登录"):
-        try:
-            user = db.find_user(username)
-            if user:
-                if user.get("password") == password:
-                    st.session_state.logged_in = True
-                    st.session_state.current_user = user.get("username")
-                    st.session_state.current_role = user.get("role") or "未知角色"
-                    st.rerun()
-                else:
-                    st.error("❌ 密码错误！")
-            else:
-                st.error("❌ 用户不存在！")
-        except Exception as e:
-            st.error(f"数据库查询失败: {e}")
+            if st.button("登 录", use_container_width=True, type="primary"):
+                try:
+                    user, upgraded = db.verify_login(username, password)
+                    if user:
+                        if upgraded:
+                            print(f"[auth] {username} 的明文密码已自动升级为 bcrypt", flush=True)
+                        st.session_state.logged_in = True
+                        st.session_state.current_user = user.get("username")
+                        st.session_state.current_role = user.get("role") or "未知角色"
+                        st.rerun()
+                    else:
+                        st.error("❌ 用户名或密码错误！")
+                except Exception as e:
+                    st.error(f"登录校验失败: {e}")
     st.stop()
 
 
@@ -131,10 +133,21 @@ if not st.session_state.logged_in:
 # 侧边栏：功能切换
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 功能菜单")
-    st.caption(f"👤 当前用户: {st.session_state.current_user} ({st.session_state.current_role})")
+    st.markdown(
+        '<div style="padding:6px 2px 14px">'
+        '<div style="font-size:19px;font-weight:700;letter-spacing:.5px">💼 财务 AI 助手</div>'
+        '<div style="font-size:12px;opacity:.75;margin-top:2px">智能分析与台账管理</div>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div style="background:rgba(255,255,255,.13);border-radius:10px;padding:8px 12px;'
+        f'font-size:13px;margin-bottom:12px">👤 {st.session_state.current_user}'
+        f'<span style="opacity:.7"> · {st.session_state.current_role}</span></div>',
+        unsafe_allow_html=True,
+    )
 
-    app_mode = st.radio("请选择功能模块：", [
+    app_mode = st.radio("功能模块", [
         "🤖 AI Agent 智能对话",
         "🧾 批量发票识别台账",
         "🗄️ 历史数据查询",
@@ -305,8 +318,10 @@ SYSTEM_PROMPT = (
 # 模块一：AI Agent 智能对话
 # ==========================================
 if app_mode == "🤖 AI Agent 智能对话":
-    st.subheader("🤖 AI 财务总监 (Agent 模式)")
-    st.info("💡 试试问我：'帮我查一下滴滴的发票总额，如果上限是1000元，还能报多少？'")
+    ui.hero(
+        "AI 财务总监",
+        "用自然语言查台账、算报销余额、做财务分析 —— 试试：「帮我查一下滴滴的发票总额，如果上限是 1000 元，还能报多少？」",
+    )
 
     with st.sidebar:
         st.markdown("---")
@@ -409,10 +424,13 @@ if app_mode == "🤖 AI Agent 智能对话":
 # 模块二：发票识别 + 存入本地 PostgreSQL
 # ==========================================
 elif app_mode == "🧾 批量发票识别台账":
-    st.subheader("一键提取发票信息并生成台账")
+    ui.hero(
+        "批量发票识别",
+        "上传 PDF 发票，自动提取字段并写入台账；相同发票号码重复上传会自动更新，不会产生重复数据。",
+    )
     uploaded_invoices = st.file_uploader("批量上传发票文件", type=["pdf"], accept_multiple_files=True)
 
-    if uploaded_invoices and st.button("🚀 开始识别并存入数据库"):
+    if uploaded_invoices and st.button("🚀 开始识别并存入数据库", type="primary"):
         invoice_data_list = []
         progress_bar = st.progress(0)
 
@@ -479,7 +497,7 @@ elif app_mode == "🧾 批量发票识别台账":
 # 模块三：历史数据查询
 # ==========================================
 elif app_mode == "🗄️ 历史数据查询":
-    st.subheader("📊 历史发票数据库与商业看板")
+    ui.hero("历史发票与商业看板", "查看全部发票台账、金额构成与开票趋势。")
 
     try:
         data = db.all_invoices()
@@ -488,10 +506,11 @@ elif app_mode == "🗄️ 历史数据查询":
             df_history = pd.DataFrame(data)
             df_history["价税合计"] = pd.to_numeric(df_history["价税合计"], errors="coerce").fillna(0)
 
-            col1, col2, col3 = st.columns(3)
             total_amount = df_history["价税合计"].sum()
-            col1.metric("💰 历史发票总金额", f"¥ {total_amount:,.2f}")
-            col2.metric("🧾 发票总张数", f"{len(df_history)} 张")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("💰 发票总金额", f"¥ {total_amount:,.2f}")
+            col2.metric("🧾 发票张数", f"{len(df_history)} 张")
+            col3.metric("📅 覆盖天数", f"{df_history['开票日期'].nunique()} 天" if "开票日期" in df_history.columns else "—")
 
             st.markdown("---")
 
@@ -520,7 +539,7 @@ elif app_mode == "🗄️ 历史数据查询":
 # 模块四：流水智能分类
 # ==========================================
 elif app_mode == "📈 流水智能分类":
-    st.subheader("📈 流水智能分类")
+    ui.hero("流水智能分类", "上传银行流水，AI 自动识别消费类型并生成分类统计。")
     uploaded_excel = st.file_uploader("上传流水 Excel 文件", type=["xlsx", "xls", "csv"])
 
     if uploaded_excel is not None:

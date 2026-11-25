@@ -1,0 +1,12 @@
+[Unit]
+Description=Finance PostgreSQL daily backup
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/finance-ai
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-/opt/finance-ai/.env
+ExecStart=/bin/bash /opt/finance-ai/backup.sh
+timeoutStartSec=600

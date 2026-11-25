@@ -35,6 +35,23 @@ PGPASSWORD="$PW" psql -h 127.0.0.1 -U finance -d finance -tAc \
   "SELECT '  ' || count(*) || ' 张发票，合计 ' || coalesce(sum(\"价税合计\"),0) || ' 元' FROM invoices;" 2>/dev/null \
   || echo "  查询失败（检查 .env 里的 PG 配置）"
 
+section "数据库备份"
+LATEST=$(ls -t /opt/finance-backup/*.sql.gz 2>/dev/null | head -1)
+if [ -n "$LATEST" ]; then
+  AGE_H=$(( ( $(date +%s) - $(stat -c %Y "$LATEST") ) / 3600 ))
+  BCOUNT=$(ls -1 /opt/finance-backup/*.sql.gz 2>/dev/null | wc -l)
+  BSIZE=$(du -sh /opt/finance-backup 2>/dev/null | cut -f1)
+  if [ "$AGE_H" -lt 30 ]; then
+    ok "最新备份 $(basename "$LATEST")  ${AGE_H} 小时前  (共 $BCOUNT 份 / $BSIZE)"
+  else
+    bad "最新备份 $(basename "$LATEST")  ${AGE_H} 小时前 ⚠️ 偏旧"
+  fi
+else
+  bad "没有找到备份文件！"
+fi
+systemctl list-timers finance-backup.timer --no-pager 2>/dev/null \
+  | grep -E 'NEXT|finance-backup' | sed 's/  */ /g' | sed 's/^/  /'
+
 section "资源"
 free -h | head -2 | sed 's/^/  /'
 df -h / | tail -1 | sed 's/^/  /'

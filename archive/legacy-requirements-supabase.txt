@@ -1,0 +1,12 @@
+streamlit
+pandas
+plotly
+zhipuai
+python-dotenv
+pdfplumber
+langchain-text-splitters
+langchain-community
+chromadb
+sentence-transformers
+supabase
+httpx

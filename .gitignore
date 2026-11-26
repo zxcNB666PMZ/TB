@@ -224,3 +224,28 @@ __pycache__/
 # 手工备份文件
 *.bak
 *.bak.*
+
+# ===== 生产环境（服务器）=====
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.bak
+*.bak.*
+*.log
+nohup.out
+*.sql.gz
+invoices_import.sql
+
+# ===== 编辑器 =====
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
